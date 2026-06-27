@@ -125,6 +125,13 @@ export interface GemmaEngineOptions {
   /** Maximum context length (tokens). Defaults to 2048. */
   contextLength?: number;
   /**
+   * Layer matmul weight storage. `'f16'` (default) dequantizes every weight to
+   * F16 on GPU. `'q8'` keeps the 7 big per-layer matmul weights as in-shader
+   * Q8_0 (int8 + per-32-block f16 scale) for ~2× less GPU memory — the lever
+   * that lets larger models fit. lmHead / embeddings / norms stay F16.
+   */
+  weightQuant?: 'f16' | 'q8';
+  /**
    * Tuning profile override. Accepts a profile id (string), a full
    * `TuningProfile` object, or a deep-partial `TuningProfileOverrides`
    * merged onto the auto-selected base. Leave unset for pure vendor

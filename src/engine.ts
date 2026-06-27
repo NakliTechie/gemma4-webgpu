@@ -88,6 +88,10 @@ export class GemmaEngineImpl implements GemmaEngine {
    * `true` selects the MR4 pipeline (4-row unrolled); `false` uses the
    * scalar matmulQuant path with `dispatchMatmul(I)`. */
   private mr4ForFfn!: boolean;
+  /** Weight storage for the layer matmul weights. 'f16' (default) dequantizes
+   *  to F16 at load; 'q8' keeps them as in-shader Q8_0 (int8 + per-32-block f16
+   *  scale) for ~2× less GPU memory. lmHead/embeddings/norms stay F16. */
+  private weightQuant: 'f16' | 'q8' = 'f16';
   private modelBuffers!: ModelBuffers;
   private workBuffers!: WorkBuffers;
   private uniformBuffers!: UniformBuffers;
@@ -207,6 +211,9 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.tuning = selected.profile;
     this.tuningReason = selected.reason;
     this.mr4ForFfn = rowsPerWorkgroupFor(this.tuning, 'ffn.linearGateUp') >= 4;
+    this.weightQuant = options.weightQuant ?? 'f16';
+    // The Q8 layer matmul is a scalar GEMV; the F16 MR4 fast-path doesn't apply.
+    if (this.weightQuant === 'q8') this.mr4ForFfn = false;
     // Log the decision for post-hoc diagnosis of unexpectedly-low tps
     // on hardware the profile registry doesn't yet know about.
     console.log(
@@ -574,6 +581,58 @@ export class GemmaEngineImpl implements GemmaEngine {
     return buf;
   }
 
+  /**
+   * Requantize an F32 weight [M, N] (N % 32 == 0) to in-shader Q8_0:
+   * symmetric int8 with one f16 scale per 32-element block. Returns a packed
+   * int8 buffer (4-per-u32) + an f16 scale buffer, both on GPU. ~2× smaller
+   * than the F16 representation.
+   */
+  private createQ8Buffers(f32: Float32Array, M: number, N: number): { quants: GPUBuffer; scales: GPUBuffer } {
+    const BLK = 32;
+    const nblocks = N / BLK;
+    const quants = new Uint8Array(M * N);
+    const scales = new Uint16Array(M * nblocks);
+    for (let m = 0; m < M; m++) {
+      const rowOff = m * N;
+      const sOff = m * nblocks;
+      for (let b = 0; b < nblocks; b++) {
+        const base = rowOff + b * BLK;
+        let amax = 0;
+        for (let i = 0; i < BLK; i++) { const v = Math.abs(f32[base + i]); if (v > amax) amax = v; }
+        const scale = amax / 127;
+        const inv = scale > 0 ? 1 / scale : 0;
+        scales[sOff + b] = f32ToF16(scale);
+        for (let i = 0; i < BLK; i++) {
+          let q = Math.round(f32[base + i] * inv);
+          if (q > 127) q = 127; else if (q < -127) q = -127;
+          quants[base + i] = q & 0xff;
+        }
+      }
+    }
+    const qU32 = new Uint32Array(quants.buffer); // M*N % 4 == 0 (N % 32 == 0)
+    const quantBuf = this.device.createBuffer({
+      size: qU32.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.wb(quantBuf, 0, qU32);
+    const scaleBuf = this.createF16Buffer(scales);
+    return { quants: quantBuf, scales: scaleBuf };
+  }
+
+  /** Build a Q8 matmul bind group (matmulQ8 layout: input, quants, scales, output, params). */
+  private mmQ8(input: GPUBuffer, layer: Record<string, GPUBuffer>, key: string, output: GPUBuffer, params: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: this.pipelines.matmulQ8.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: input } },
+        { binding: 1, resource: { buffer: layer[key] } },
+        { binding: 2, resource: { buffer: layer[`${key}__s`] } },
+        { binding: 3, resource: { buffer: output } },
+        { binding: 4, resource: { buffer: params } },
+      ],
+    });
+  }
+
   /** Dequantize any GGUF tensor to F16 bit patterns. One-time CPU cost at upload. */
   private tensorToF16(parser: GGUFParser, tensor: GGUFTensor, dataOffset: number): Uint16Array {
     // F16 source can be used directly without the F32 round-trip.
@@ -854,6 +913,16 @@ export class GemmaEngineImpl implements GemmaEngine {
       return { buf, byteLength: f16.byteLength };
     };
 
+    // Q8 path: dequant source → F32 → requantize to in-shader Q8_0. dims[0]=N
+    // (contraction/input), dims[1]=M (output rows) in GGUF's reversed layout.
+    const uploadTensorQ8 = (bytes: Uint8Array, localOffset: number, tensor: GGUFTensor): { quants: GPUBuffer; scales: GPUBuffer } => {
+      const tp = new GGUFParser(bytes);
+      const f32 = tp.getTensorData({ ...tensor, offset: BigInt(localOffset) }, 0);
+      const N = Number(tensor.dims[0]);
+      const M = Number(tensor.dims[1]);
+      return this.createQ8Buffers(f32, M, N);
+    };
+
     let totalUploaded = 0;
     const totalWeightBytes = tensors.reduce((sum, t) => sum + tensorByteSize(t), 0);
 
@@ -972,8 +1041,13 @@ export class GemmaEngineImpl implements GemmaEngine {
         const tensor = layerTensors.find(t => t.name === prefix + key + '.weight');
         if (tensor) {
           const localOffset = Number(tensor.offset) - minOffset;
-          const result = uploadTensor(layerBytes, localOffset, tensor, true);
-          layer[key] = result.buf;
+          if (this.weightQuant === 'q8') {
+            const { quants, scales } = uploadTensorQ8(layerBytes, localOffset, tensor);
+            layer[key] = quants;
+            layer[`${key}__s`] = scales;
+          } else {
+            layer[key] = uploadTensor(layerBytes, localOffset, tensor, true).buf;
+          }
         }
       }
       this.modelBuffers.layers[i] = layer;
@@ -1183,7 +1257,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.rmsNorm } },
           ],
         }),
-        linearQ: this.device.createBindGroup({
+        linearQ: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.normed, layer, 'attn_q', this.workBuffers.q, this.uniformBuffers.linearQ8_Q_H[i])
+          : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.normed } },
@@ -1192,7 +1268,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.linearQ8_Q_H[i] } },
           ],
         }),
-        linearK: this.device.createBindGroup({
+        linearK: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.normed, layer, 'attn_k', this.workBuffers.k, this.uniformBuffers.linearQ8_KV_H[i])
+          : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.normed } },
@@ -1201,7 +1279,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.linearQ8_KV_H[i] } },
           ],
         }),
-        linearV: this.device.createBindGroup({
+        linearV: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.normed, layer, 'attn_v', this.workBuffers.v, this.uniformBuffers.linearQ8_KV_H[i])
+          : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.normed } },
@@ -1307,7 +1387,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.attnOutput[i] } },
           ],
         }),
-        linearAttnOut: this.device.createBindGroup({
+        linearAttnOut: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.attnOut, layer, 'attn_output', this.workBuffers.attnProj, this.uniformBuffers.linearQ8_H_Q[i])
+          : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.attnOut } },
@@ -1348,7 +1430,9 @@ export class GemmaEngineImpl implements GemmaEngine {
         // tuning profile at init. `layout: 'auto'` gives each pipeline a
         // unique layout object even when the struct is identical, so bind
         // groups are not interchangeable across pipelines — match exactly.
-        ffnGate: this.device.createBindGroup({
+        ffnGate: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.normed, layer, 'ffn_gate', this.workBuffers.ffnGate, this.uniformBuffers.linearQ8_I_H[i])
+          : this.device.createBindGroup({
           layout: (this.mr4ForFfn ? this.pipelines.matmulQuantMR4 : this.pipelines.matmulQuant).getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.normed } },
@@ -1357,7 +1441,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.linearQ8_I_H[i] } },
           ],
         }),
-        ffnUp: this.device.createBindGroup({
+        ffnUp: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.normed, layer, 'ffn_up', this.workBuffers.ffnUp, this.uniformBuffers.linearQ8_I_H[i])
+          : this.device.createBindGroup({
           layout: (this.mr4ForFfn ? this.pipelines.matmulQuantMR4 : this.pipelines.matmulQuant).getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.normed } },
@@ -1377,7 +1463,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.sizeI[i] } },
           ],
         }),
-        ffnDown: this.device.createBindGroup({
+        ffnDown: this.weightQuant === 'q8'
+          ? this.mmQ8(this.workBuffers.ffnMul, layer, 'ffn_down', this.workBuffers.ffnDown, this.uniformBuffers.linearQ8_H_I[i])
+          : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.ffnMul } },
@@ -1593,9 +1681,11 @@ export class GemmaEngineImpl implements GemmaEngine {
       const Q = NQH * HD;
       const KV = NKH * HD;
       const isProducer = isKvProducerLayer(layerIdx, C);
+      // Layer matmul weights are F16 (matmulQuant) or in-shader Q8 (matmulQ8).
+      const mmPipe = this.weightQuant === 'q8' ? this.pipelines.matmulQ8 : this.pipelines.matmulQuant;
       pass = this.beginPass(encoder, 'attn.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
       pass = this.beginPass(encoder, isProducer ? 'attn.linearQKV.producer' : 'attn.linearQ.consumer');
-      pass.setPipeline(this.pipelines.matmulQuant);
+      pass.setPipeline(mmPipe);
       pass.setBindGroup(0, lb.linearQ); this.dispatchMatmul(pass, Q);
       if (isProducer) {
         pass.setBindGroup(0, lb.linearK); this.dispatchMatmul(pass, KV);
@@ -1633,7 +1723,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       pass = this.beginPass(encoder, 'attn.softmax'); pass.setPipeline(this.pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
       pass = this.beginPass(encoder, 'attn.attnOutput'); pass.setPipeline(this.pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
       if (stopAt && stopAt.kind === 'attnOut' && stopAt.layer === layerIdx) return;
-      pass = this.beginPass(encoder, 'attn.linearOut'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.linearAttnOut); this.dispatchMatmul(pass, H); pass.end();
+      pass = this.beginPass(encoder, 'attn.linearOut'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.linearAttnOut); this.dispatchMatmul(pass, H); pass.end();
       // Post-attention residual. Gemma: norm(attnProj)+hidden (fused). Qwen3: plain hidden+attnProj.
       if (C.post_attn_norm === false) {
         pass = this.beginPass(encoder, 'attn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenAttnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
@@ -1649,9 +1739,8 @@ export class GemmaEngineImpl implements GemmaEngine {
         pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(I >> 2, 1, 1);
         pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(I >> 2, 1, 1);
       } else {
-        // Scalar matmul fallback. Tuning profiles with
-        // `rowsPerWorkgroupByKernel['ffn.linearGateUp'] < 4` land here.
-        pass.setPipeline(this.pipelines.matmulQuant);
+        // Scalar matmul fallback (always taken for q8 — mr4 is F16-only).
+        pass.setPipeline(mmPipe);
         pass.setBindGroup(0, lb.ffnGate); this.dispatchMatmul(pass, I);
         pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmul(pass, I);
       }
@@ -1659,7 +1748,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       // FFN activation: Gemma tanh-GELU, Qwen3 SwiGLU/SiLU. Same bind-group layout.
       const actPipeline = C.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul;
       pass = this.beginPass(encoder, 'ffn.actMul'); pass.setPipeline(actPipeline); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
-      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmul(pass, H); pass.end();
+      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmul(pass, H); pass.end();
       // Post-FFN residual. Gemma: norm(ffnDown)+residual (fused). Qwen3: plain residual+ffnDown.
       if (C.post_ffn_norm === false) {
         pass = this.beginPass(encoder, 'ffn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenFfnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();

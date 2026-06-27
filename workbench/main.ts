@@ -107,7 +107,7 @@ interface Lab {
   loadProgress: ProgressInfo | null;
   reference: LoadedReference | null;
 
-  init: (modelKey?: string, opts?: { contextLength?: number; tuning?: TuningOverride }) => Promise<Readonly<GemmaConfig>>;
+  init: (modelKey?: string, opts?: { contextLength?: number; tuning?: TuningOverride; weightQuant?: 'f16' | 'q8' }) => Promise<Readonly<GemmaConfig>>;
   bench: (prompt?: string, opts?: { maxTokens?: number; runs?: number }) => Promise<BenchResult>;
   dispose: () => void;
   state: () => {
@@ -309,6 +309,7 @@ const lab: Lab = {
       model: modelKey,
       contextLength: opts.contextLength,
       tuning: opts.tuning ?? undefined,
+      weightQuant: opts.weightQuant ?? undefined,
       onProgress: (p) => {
         lab.loadProgress = p;
         const pct = p.total ? `${((p.loaded / p.total) * 100).toFixed(1)}%` : '';

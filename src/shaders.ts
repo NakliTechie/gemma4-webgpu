@@ -20,6 +20,7 @@ import kvCacheStoreSrc from '../shaders/kv_cache_store.wgsl?raw';
 import logitSoftcapSrc from '../shaders/logit_softcap.wgsl?raw';
 import matmulQuantSrc from '../shaders/matmul_quant.wgsl?raw';
 import matmulQuantMR4Src from '../shaders/matmul_quant_mr4.wgsl?raw';
+import matmulQ8Src from '../shaders/matmul_q8.wgsl?raw';
 import perHeadRmsNormSrc from '../shaders/per_head_rms_norm.wgsl?raw';
 import perHeadRmsNormNoWeightSrc from '../shaders/per_head_rms_norm_no_weight.wgsl?raw';
 import pleGeluMulSrc from '../shaders/ple_gelu_mul.wgsl?raw';
@@ -45,6 +46,7 @@ export const SHADERS: Record<string, string> = {
   logitSoftcap: logitSoftcapSrc,
   matmulQuant: matmulQuantSrc,
   matmulQuantMR4: matmulQuantMR4Src,
+  matmulQ8: matmulQ8Src,
   perHeadRmsNorm: perHeadRmsNormSrc,
   perHeadRmsNormNoWeight: perHeadRmsNormNoWeightSrc,
   pleGeluMul: pleGeluMulSrc,
