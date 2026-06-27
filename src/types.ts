@@ -59,10 +59,36 @@ export interface GemmaConfig {
    * Length = num_layers.
    */
   kv_producer_for_layer: number[];
-  /** Per-layer input embedding dim (Gemma 4 E2B PLE: 256). */
+  /** Per-layer input embedding dim (Gemma 4 E2B PLE: 256). Qwen3: 0 (no PLE). */
   per_layer_input_dim: number;
   /** tanh softcap applied to final logits (Gemma 4 E2B: 30.0). */
   final_logit_softcapping: number;
+
+  // ── Architecture-variant flags (additive; undefined ⇒ Gemma 4 default) ──
+  /**
+   * Model family discriminator. `undefined`/`'gemma4'` selects the original
+   * Gemma 4 path (PLE on, 4-norm sandwich, V-norm, GELU, √hidden embed scale).
+   * `'qwen3'` selects the simplified path gated by the flags below.
+   */
+  arch?: 'gemma4' | 'qwen3';
+  /** FFN activation. Undefined ⇒ 'gelu' (Gemma). Qwen3: 'silu' (SwiGLU). */
+  ffn_activation?: 'gelu' | 'silu';
+  /** Per-KV-head V-norm before cache store. Undefined ⇒ true (Gemma). Qwen3: false. */
+  v_norm?: boolean;
+  /** Post-attention RMSNorm before the residual add (Gemma sandwich). Undefined ⇒ true. Qwen3: false. */
+  post_attn_norm?: boolean;
+  /** Post-FFN RMSNorm before the residual add (Gemma sandwich). Undefined ⇒ true. Qwen3: false. */
+  post_ffn_norm?: boolean;
+  /**
+   * Embedding scale applied at lookup. Undefined ⇒ sqrt(hidden_size) (Gemma).
+   * Qwen3: 1.0 (no scaling). Resolved to a concrete number by the engine.
+   */
+  embedding_scale?: number;
+  /**
+   * Separate (untied) LM-head tensor name in the GGUF, if present. Undefined ⇒
+   * tied embeddings (reuse token_embd as the LM head). Qwen3 4B/8B: 'output'.
+   */
+  lm_head_tensor?: string;
 }
 
 /** True if layer `il` uses sliding-window (LOCAL) attention. */
@@ -587,8 +613,8 @@ export interface BindGroupCache {
   argmax: GPUBindGroup;
   topk256: GPUBindGroup;
   layers: LayerBindGroups[];
-  // Per-layer-embedding bind groups. Always populated.
-  plePmProjMatmul: GPUBindGroup;
+  // Per-layer-embedding bind groups. Gemma 4 only — undefined/empty for Qwen3.
+  plePmProjMatmul?: GPUBindGroup;
   pleStage1Fuse: GPUBindGroup[];
 }
 
@@ -620,6 +646,9 @@ export interface LayerBindGroups {
   residualAdd2: GPUBindGroup;
   fusedPostAttnNormAdd: GPUBindGroup;
   fusedPostFfnNormAdd: GPUBindGroup;
+  // Qwen3 pre-norm residual adds (plain `add`, no post-block norm).
+  qwenAttnAdd: GPUBindGroup;
+  qwenFfnAdd: GPUBindGroup;
   // PLE Stage 2 bind groups. Populated for every layer.
   pleInpGateMatmul: GPUBindGroup;
   pleGeluMul: GPUBindGroup;

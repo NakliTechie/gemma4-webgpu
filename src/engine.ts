@@ -3,6 +3,7 @@ import { GGUFParser, tensorByteSize, f32ToF16Array, f32ToF16 } from './gguf.js';
 import { Tokenizer } from './tokenizer.js';
 import { buildChatPrompt } from './conversation.js';
 import { defaultConfig, configFromGGUF } from './config/gemma4-e2b.js';
+import { configFromGGUFQwen3 } from './config/qwen3-4b.js';
 import { selectDeviceProfile, rowsPerWorkgroupFor, type TuningProfile } from './tuning/index.js';
 import { RangedReader } from './ranged-reader.js';
 import {
@@ -227,7 +228,9 @@ export class GemmaEngineImpl implements GemmaEngine {
 
       const parser = new GGUFParser(headerBuf);
       const gguf = parser.parse();
-      this.config = configFromGGUF(gguf, options.contextLength);
+      this.config = gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
+        ? configFromGGUFQwen3(gguf, options.contextLength)
+        : configFromGGUF(gguf, options.contextLength);
 
       this.tokenizer = new Tokenizer();
       this.tokenizer.extractFromGGUF(gguf);
@@ -267,7 +270,9 @@ export class GemmaEngineImpl implements GemmaEngine {
 
       const parser = new GGUFParser(buffer);
       const gguf = parser.parse();
-      this.config = configFromGGUF(gguf, options.contextLength);
+      this.config = gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
+        ? configFromGGUFQwen3(gguf, options.contextLength)
+        : configFromGGUF(gguf, options.contextLength);
 
       this.tokenizer = new Tokenizer();
       this.tokenizer.extractFromGGUF(gguf);
@@ -292,7 +297,7 @@ export class GemmaEngineImpl implements GemmaEngine {
     // (PLE) with a positive per_layer_input_dim. The forward pass and the
     // bind-group layout assume PLE is always active, so fail loud if the
     // GGUF metadata somehow yields 0 — cleaner than silent wrong output.
-    if (this.config.per_layer_input_dim === 0) {
+    if (this.config.arch !== 'qwen3' && this.config.per_layer_input_dim === 0) {
       throw new Error(
         'per_layer_input_dim = 0 — this engine is Gemma-4-E2B-specific and requires PLE. ' +
         'Check that the GGUF is a Gemma 4 variant.',
@@ -440,7 +445,8 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.uniformBuffers = {
       rmsNorm: this.makeUniformMixed([{ u: H }, { f: C.rms_norm_eps }]),
       sizeH: this.makeUniformMixed([{ u: H }]),
-      embeddingLookup: this.makeUniformMixed([{ u: H }, { u: 0 }]),
+      // embed_scale: Gemma 4 = sqrt(hidden); Qwen3 = 1.0 (config.embedding_scale).
+      embeddingLookup: this.makeUniformMixed([{ u: H }, { u: 0 }, { f: C.embedding_scale ?? Math.sqrt(H) }]),
       softmax: this.makeUniformMixed([{ u: NQH }, { u: 0 }]),
       linearQ8_V_H: this.makeUniformMixed([{ u: V }, { u: H }]),
       argmaxSize: this.makeUniformMixed([{ u: V }]),
@@ -503,17 +509,17 @@ export class GemmaEngineImpl implements GemmaEngine {
       // `sliding_window` positions; GLOBAL (full-attention) layers attend
       // to everything.
       const slidingWindow = isSwaLayer(il, C) ? C.sliding_window : 0;
-      // Attention scaling = 1.0, NOT the standard 1/sqrt(head_dim). Reason:
-      // q_norm and k_norm per-head RMSNorm each Q and K head to unit RMS
-      // (weight-modulated), so QK^T magnitudes are already controlled
-      // without the sqrt(d) compensation. Source: transformers 5.5.4's
-      // `Gemma4TextAttention.scaling = 1.0` on every layer. Using 1/sqrt(HD)
-      // here would produce softmax inputs 16× smaller, flattening the
-      // attention distribution and smearing the attention output's direction.
+      // Attention scaling. Gemma 4 uses 1.0 (q_norm/k_norm per-head RMSNorm
+      // already control QK^T magnitude; transformers 5.5.4
+      // `Gemma4TextAttention.scaling = 1.0`). Qwen3 keeps the STANDARD
+      // 1/sqrt(head_dim) despite also having QK-norm (HF `Qwen3Attention.scaling
+      // = head_dim**-0.5`); using 1.0 there makes softmax inputs ~sqrt(128)×
+      // too large → attention collapses to one token → degenerate repetition.
+      const attnScaling = C.arch === 'qwen3' ? 1.0 / Math.sqrt(HD) : 1.0;
       this.uniformBuffers.attnScore.push(
         this.makeUniformMixed([
           { u: NQH }, { u: NKH }, { u: HD },
-          { u: 0 }, { f: 1.0 }, { u: slidingWindow },
+          { u: 0 }, { f: attnScaling }, { u: slidingWindow },
         ])
       );
       this.uniformBuffers.attnOutput.push(
@@ -522,7 +528,9 @@ export class GemmaEngineImpl implements GemmaEngine {
       // apply_divisor=1 for GLOBAL layers (rope_freqs table encodes partial_rotary_factor=0.25
       // as divisor: 1.0 for indices 0..63, 1e30 for 64..255 → annihilates rotation on trailing
       // pairs). LOCAL layers use plain 1/pow(theta, ...) schedule with no divisor.
-      const applyDivisor = isSwaLayer(il, C) ? 0 : 1;
+      // Qwen3 uses plain RoPE (theta 1e6, no divisor table) on every layer.
+      // Gemma applies the rope_freqs divisor on GLOBAL (full-attention) layers only.
+      const applyDivisor = C.arch === 'qwen3' ? 0 : (isSwaLayer(il, C) ? 0 : 1);
       this.uniformBuffers.ropeQ.push(
         this.makeUniformMixed([{ u: NQH }, { u: HD }, { u: 0 }, { f: theta }])
       );
@@ -876,6 +884,14 @@ export class GemmaEngineImpl implements GemmaEngine {
     // Upload final norm. Marked readable for the finalNorm diagnostic probe.
     this.modelBuffers.finalNorm = await streamOneTensor('output_norm', true);
 
+    // Untied LM head (Qwen3 4B/8B ship a separate `output.weight`; smaller
+    // models tie embeddings). When present, used as the LM-head weight instead
+    // of token_embd.
+    if (this.config.lm_head_tensor) {
+      const lmHeadBuf = await streamOneTensor(this.config.lm_head_tensor, true);
+      if (lmHeadBuf) this.modelBuffers.globals['lm_head'] = lmHeadBuf;
+    }
+
     // Small global tensors (per_layer_model_proj, per_layer_proj_norm, rope_freqs).
     // Uploaded with COPY_SRC to support weight-layout diagnostic probes.
     for (const name of GLOBAL_F32_TENSORS) {
@@ -1064,9 +1080,12 @@ export class GemmaEngineImpl implements GemmaEngine {
   }
 
   private createBindGroups(): void {
+    const isQwen3 = this.config.arch === 'qwen3';
     // Per-layer embedding bind groups — built first so they can land
-    // directly in the BindGroupCache object literal below.
-    const plePmProjMatmul = this.device.createBindGroup({
+    // directly in the BindGroupCache object literal below. Qwen3 has no PLE,
+    // and the per_layer_model_proj / per_layer_proj_norm / perLayerEmbeddings
+    // buffers are never loaded for it — so skip these entirely.
+    const plePmProjMatmul = isQwen3 ? undefined : this.device.createBindGroup({
       layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.workBuffers.hidden } },
@@ -1076,17 +1095,19 @@ export class GemmaEngineImpl implements GemmaEngine {
       ],
     });
     const pleStage1Fuse: GPUBindGroup[] = [];
-    for (let i = 0; i < this.config.num_layers; i++) {
-      pleStage1Fuse.push(this.device.createBindGroup({
-        layout: this.pipelines.pleStage1Fuse.getBindGroupLayout(0),
-        entries: [
-          { binding: 0, resource: { buffer: this.workBuffers.plePmProjected } },
-          { binding: 1, resource: { buffer: this.modelBuffers.globals.per_layer_proj_norm } },
-          { binding: 2, resource: { buffer: this.modelBuffers.perLayerEmbeddings[i] } },
-          { binding: 3, resource: { buffer: this.workBuffers.pleInputs } },
-          { binding: 4, resource: { buffer: this.uniformBuffers.pleStage1[i] } },
-        ],
-      }));
+    if (!isQwen3) {
+      for (let i = 0; i < this.config.num_layers; i++) {
+        pleStage1Fuse.push(this.device.createBindGroup({
+          layout: this.pipelines.pleStage1Fuse.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: this.workBuffers.plePmProjected } },
+            { binding: 1, resource: { buffer: this.modelBuffers.globals.per_layer_proj_norm } },
+            { binding: 2, resource: { buffer: this.modelBuffers.perLayerEmbeddings[i] } },
+            { binding: 3, resource: { buffer: this.workBuffers.pleInputs } },
+            { binding: 4, resource: { buffer: this.uniformBuffers.pleStage1[i] } },
+          ],
+        }));
+      }
     }
 
     const bgc: BindGroupCache = {
@@ -1111,7 +1132,8 @@ export class GemmaEngineImpl implements GemmaEngine {
         layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: this.workBuffers.normed } },
-          { binding: 1, resource: { buffer: this.modelBuffers.tokenEmbed! } },
+          // Untied LM head if loaded (Qwen3 4B/8B), else tied embeddings.
+          { binding: 1, resource: { buffer: this.modelBuffers.globals['lm_head'] ?? this.modelBuffers.tokenEmbed! } },
           { binding: 2, resource: { buffer: this.workBuffers.logits } },
           { binding: 3, resource: { buffer: this.uniformBuffers.linearQ8_V_H } },
         ],
@@ -1234,7 +1256,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 0, resource: { buffer: this.workBuffers.q } },
             { binding: 1, resource: { buffer: layer.attn_q_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.fusedNormRopeQ[i] } },
-            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs } },
+            // Qwen3 has no rope_freqs table (apply_divisor=0 ⇒ never read); bind a
+            // present F16 buffer to satisfy the layout.
+            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_q_norm } },
           ],
         }),
         fusedNormRopeK: this.device.createBindGroup({
@@ -1243,7 +1267,7 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 0, resource: { buffer: this.workBuffers.k } },
             { binding: 1, resource: { buffer: layer.attn_k_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.fusedNormRopeK[i] } },
-            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs } },
+            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_k_norm } },
           ],
         }),
         // kvStore writes to this layer's own cache (meaningless for consumer layers; they
@@ -1296,7 +1320,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.rmsNorm.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.attnProj } },
-            { binding: 1, resource: { buffer: layer.post_attention_norm } },
+            { binding: 1, resource: { buffer: layer.post_attention_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.postAttnNormed } },
             { binding: 3, resource: { buffer: this.uniformBuffers.rmsNorm } },
           ],
@@ -1342,8 +1366,10 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.linearQ8_I_H[i] } },
           ],
         }),
+        // Activation bind group. Built from whichever pipeline the forward pass
+        // will dispatch (auto-layouts aren't interchangeable across pipelines).
         geluMul: this.device.createBindGroup({
-          layout: this.pipelines.geluMul.getBindGroupLayout(0),
+          layout: (this.config.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul).getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.ffnGate } },
             { binding: 1, resource: { buffer: this.workBuffers.ffnUp } },
@@ -1364,7 +1390,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.rmsNorm.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.ffnDown } },
-            { binding: 1, resource: { buffer: layer.post_ffw_norm } },
+            { binding: 1, resource: { buffer: layer.post_ffw_norm ?? layer.ffn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.postFfnNormed } },
             { binding: 3, resource: { buffer: this.uniformBuffers.rmsNorm } },
           ],
@@ -1382,7 +1408,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.fusedNormAdd.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.attnProj } },
-            { binding: 1, resource: { buffer: layer.post_attention_norm } },
+            { binding: 1, resource: { buffer: layer.post_attention_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.hidden } },
             { binding: 3, resource: { buffer: this.workBuffers.residual } },
             { binding: 4, resource: { buffer: this.uniformBuffers.rmsNorm } },
@@ -1392,7 +1418,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.fusedNormAdd.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.ffnDown } },
-            { binding: 1, resource: { buffer: layer.post_ffw_norm } },
+            { binding: 1, resource: { buffer: layer.post_ffw_norm ?? layer.ffn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.residual } },
             { binding: 3, resource: { buffer: this.workBuffers.hidden } },
             { binding: 4, resource: { buffer: this.uniformBuffers.rmsNorm } },
@@ -1404,7 +1430,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.hidden } },
-            { binding: 1, resource: { buffer: layer.inp_gate } },
+            { binding: 1, resource: { buffer: layer.inp_gate ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.pleGate } },
             { binding: 3, resource: { buffer: this.uniformBuffers.pleInpGateMM } },
           ],
@@ -1424,7 +1450,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.pleGated } },
-            { binding: 1, resource: { buffer: layer.proj } },
+            { binding: 1, resource: { buffer: layer.proj ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.pleProjOut } },
             { binding: 3, resource: { buffer: this.uniformBuffers.plePostProjMM } },
           ],
@@ -1434,7 +1460,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.rmsNorm.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.pleProjOut } },
-            { binding: 1, resource: { buffer: layer.post_norm } },
+            { binding: 1, resource: { buffer: layer.post_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.workBuffers.plePostNormed } },
             { binding: 3, resource: { buffer: this.uniformBuffers.rmsNorm } },
           ],
@@ -1445,8 +1471,29 @@ export class GemmaEngineImpl implements GemmaEngine {
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.hidden } },
             { binding: 1, resource: { buffer: this.workBuffers.plePostNormed } },
-            { binding: 2, resource: { buffer: layer.layer_output_scale } },
+            { binding: 2, resource: { buffer: layer.layer_output_scale ?? layer.attn_norm } },
             { binding: 3, resource: { buffer: this.uniformBuffers.pleSkipScaleAdd } },
+          ],
+        }),
+        // Qwen3 pre-norm residual adds (replace Gemma's fused post-norm+add).
+        // qwenAttnAdd: residual = hidden + attnProj.  qwenFfnAdd: hidden = residual + ffnDown.
+        // Created for every arch (work-buffer-only; unused on the Gemma path).
+        qwenAttnAdd: this.device.createBindGroup({
+          layout: this.pipelines.add.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: this.workBuffers.hidden } },
+            { binding: 1, resource: { buffer: this.workBuffers.attnProj } },
+            { binding: 2, resource: { buffer: this.workBuffers.residual } },
+            { binding: 3, resource: { buffer: this.uniformBuffers.sizeH } },
+          ],
+        }),
+        qwenFfnAdd: this.device.createBindGroup({
+          layout: this.pipelines.add.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: this.workBuffers.residual } },
+            { binding: 1, resource: { buffer: this.workBuffers.ffnDown } },
+            { binding: 2, resource: { buffer: this.workBuffers.hidden } },
+            { binding: 3, resource: { buffer: this.uniformBuffers.sizeH } },
           ],
         }),
       };
@@ -1516,25 +1563,28 @@ export class GemmaEngineImpl implements GemmaEngine {
     if (stopAt?.kind === 'embed') return;
 
     // Per-layer embedding Stage 1 (runs once, before layer 0). Produces
-    // workBuffers.pleInputs [num_layers × per_layer_input_dim].
-    const pleOut = C.num_layers * C.per_layer_input_dim;
-    pass = this.beginPass(encoder, 'ple1.pmProj');
-    pass.setPipeline(this.pipelines.matmulQuant);
-    pass.setBindGroup(0, this.bindGroupCache.plePmProjMatmul);
-    this.dispatchMatmul(pass, pleOut);
-    pass.end();
+    // workBuffers.pleInputs [num_layers × per_layer_input_dim]. Gemma 4 only —
+    // Qwen3 has no PLE.
+    if (C.arch !== 'qwen3') {
+      const pleOut = C.num_layers * C.per_layer_input_dim;
+      pass = this.beginPass(encoder, 'ple1.pmProj');
+      pass.setPipeline(this.pipelines.matmulQuant);
+      pass.setBindGroup(0, this.bindGroupCache.plePmProjMatmul!);
+      this.dispatchMatmul(pass, pleOut);
+      pass.end();
 
-    if (stopAt?.kind === 'plePmProjected') return;
+      if (stopAt?.kind === 'plePmProjected') return;
 
-    pass = this.beginPass(encoder, 'ple1.stage1Fuse');
-    pass.setPipeline(this.pipelines.pleStage1Fuse);
-    for (let il = 0; il < C.num_layers; il++) {
-      pass.setBindGroup(0, this.bindGroupCache.pleStage1Fuse[il]);
-      pass.dispatchWorkgroups(1);
+      pass = this.beginPass(encoder, 'ple1.stage1Fuse');
+      pass.setPipeline(this.pipelines.pleStage1Fuse);
+      for (let il = 0; il < C.num_layers; il++) {
+        pass.setBindGroup(0, this.bindGroupCache.pleStage1Fuse[il]);
+        pass.dispatchWorkgroups(1);
+      }
+      pass.end();
+
+      if (stopAt?.kind === 'pleStage1') return;
     }
-    pass.end();
-
-    if (stopAt?.kind === 'pleStage1') return;
 
     for (let layerIdx = 0; layerIdx < C.num_layers; layerIdx++) {
       const lb = this.bindGroupCache.layers[layerIdx];
@@ -1559,7 +1609,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       // so cached V (shared by consumer layers) is already normalized. Producer-only;
       // consumers read the normalized V straight from the shared cache. Must run before
       // `kvCacheStore` below.
-      if (isProducer) {
+      if (isProducer && C.v_norm !== false) {
         pass = this.beginPass(encoder, 'attn.vNorm');
         pass.setPipeline(this.pipelines.perHeadRmsNormNoWeight);
         pass.setBindGroup(0, lb.vNorm);
@@ -1584,7 +1634,12 @@ export class GemmaEngineImpl implements GemmaEngine {
       pass = this.beginPass(encoder, 'attn.attnOutput'); pass.setPipeline(this.pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
       if (stopAt && stopAt.kind === 'attnOut' && stopAt.layer === layerIdx) return;
       pass = this.beginPass(encoder, 'attn.linearOut'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.linearAttnOut); this.dispatchMatmul(pass, H); pass.end();
-      pass = this.beginPass(encoder, 'attn.postNormAdd'); pass.setPipeline(this.pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      // Post-attention residual. Gemma: norm(attnProj)+hidden (fused). Qwen3: plain hidden+attnProj.
+      if (C.post_attn_norm === false) {
+        pass = this.beginPass(encoder, 'attn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenAttnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      } else {
+        pass = this.beginPass(encoder, 'attn.postNormAdd'); pass.setPipeline(this.pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      }
       pass = this.beginPass(encoder, 'ffn.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
       pass = this.beginPass(encoder, 'ffn.linearGateUp');
       if (this.mr4ForFfn) {
@@ -1601,19 +1656,26 @@ export class GemmaEngineImpl implements GemmaEngine {
         pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmul(pass, I);
       }
       pass.end();
-      pass = this.beginPass(encoder, 'ffn.geluMul'); pass.setPipeline(this.pipelines.geluMul); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
+      // FFN activation: Gemma tanh-GELU, Qwen3 SwiGLU/SiLU. Same bind-group layout.
+      const actPipeline = C.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul;
+      pass = this.beginPass(encoder, 'ffn.actMul'); pass.setPipeline(actPipeline); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
       pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmul(pass, H); pass.end();
-      pass = this.beginPass(encoder, 'ffn.postNormAdd'); pass.setPipeline(this.pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      // Post-FFN residual. Gemma: norm(ffnDown)+residual (fused). Qwen3: plain residual+ffnDown.
+      if (C.post_ffn_norm === false) {
+        pass = this.beginPass(encoder, 'ffn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenFfnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      } else {
+        pass = this.beginPass(encoder, 'ffn.postNormAdd'); pass.setPipeline(this.pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostFfnNormAdd); pass.dispatchWorkgroups(1); pass.end();
+      }
 
-      // Gemma 4 PLE Stage 2 (per-layer) + layer_output_scale. Runs after fusedPostFfnNormAdd,
-      // which just wrote the post-FFN residual stream to `hidden`.
-      // PLE Stage 2 — five passes per layer.
-      const P = C.per_layer_input_dim;
-      pass = this.beginPass(encoder, 'ple2.linearInpGate'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.pleInpGateMatmul); this.dispatchMatmul(pass, P); pass.end();
-      pass = this.beginPass(encoder, 'ple2.geluMul'); pass.setPipeline(this.pipelines.pleGeluMul); pass.setBindGroup(0, lb.pleGeluMul); pass.dispatchWorkgroups(Math.ceil(P / 256)); pass.end();
-      pass = this.beginPass(encoder, 'ple2.linearPostProj'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.plePostProjMatmul); this.dispatchMatmul(pass, H); pass.end();
-      pass = this.beginPass(encoder, 'ple2.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.plePostNorm); pass.dispatchWorkgroups(1); pass.end();
-      pass = this.beginPass(encoder, 'ple2.skipScaleAdd'); pass.setPipeline(this.pipelines.pleSkipScaleAdd); pass.setBindGroup(0, lb.pleSkipScaleAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      // Gemma 4 PLE Stage 2 (per-layer) + layer_output_scale. Qwen3 has no PLE.
+      if (C.arch !== 'qwen3') {
+        const P = C.per_layer_input_dim;
+        pass = this.beginPass(encoder, 'ple2.linearInpGate'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.pleInpGateMatmul); this.dispatchMatmul(pass, P); pass.end();
+        pass = this.beginPass(encoder, 'ple2.geluMul'); pass.setPipeline(this.pipelines.pleGeluMul); pass.setBindGroup(0, lb.pleGeluMul); pass.dispatchWorkgroups(Math.ceil(P / 256)); pass.end();
+        pass = this.beginPass(encoder, 'ple2.linearPostProj'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.plePostProjMatmul); this.dispatchMatmul(pass, H); pass.end();
+        pass = this.beginPass(encoder, 'ple2.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.plePostNorm); pass.dispatchWorkgroups(1); pass.end();
+        pass = this.beginPass(encoder, 'ple2.skipScaleAdd'); pass.setPipeline(this.pipelines.pleSkipScaleAdd); pass.setBindGroup(0, lb.pleSkipScaleAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      }
 
       if (stopAt?.kind === 'afterLayer' && stopAt.layer === layerIdx) return;
     }

@@ -27,6 +27,7 @@ import pleSkipScaleAddSrc from '../shaders/ple_skip_scale_add.wgsl?raw';
 import pleStage1FuseSrc from '../shaders/ple_stage1_fuse.wgsl?raw';
 import rmsNormSrc from '../shaders/rms_norm.wgsl?raw';
 import ropeSrc from '../shaders/rope.wgsl?raw';
+import siluMulSrc from '../shaders/silu_mul.wgsl?raw';
 import softmaxSrc from '../shaders/softmax.wgsl?raw';
 import topk256Src from '../shaders/topk256.wgsl?raw';
 
@@ -51,6 +52,7 @@ export const SHADERS: Record<string, string> = {
   pleStage1Fuse: pleStage1FuseSrc,
   rmsNorm: rmsNormSrc,
   rope: ropeSrc,
+  siluMul: siluMulSrc,
   softmax: softmaxSrc,
   topk256: topk256Src,
 };
