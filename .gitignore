@@ -22,3 +22,6 @@ reference/**/dumps/
 reference/**/.venv/
 reference/**/__pycache__/
 reference/**/.cache/
+
+# library build output (the bundle is committed in the parent repo's engine/)
+dist-lib/
