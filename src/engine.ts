@@ -359,6 +359,18 @@ export class GemmaEngineImpl implements GemmaEngine {
     pass.dispatchWorkgroups(x, y, 1);
   }
 
+  /**
+   * Matmul dispatch that accounts for the active matmul pipeline's rows-per-
+   * workgroup: the q4k MR kernel produces 4 rows/workgroup → ceil(M/4) groups;
+   * f16/q8 scalar produce 1 row → M groups (identical to dispatchMatmul). The
+   * shader recovers the base row as (wg.y*ng.x + wg.x)*R, so the same 2D
+   * overflow scheme applies to the workgroup count.
+   */
+  private dispatchMatmulRows(pass: GPUComputePassEncoder, M: number): void {
+    const R = this.weightQuant === 'q4k' ? 4 : 1;
+    this.dispatchMatmul(pass, Math.ceil(M / R));
+  }
+
   private reportProgress(
     loaded: number,
     total: number,
@@ -694,7 +706,7 @@ export class GemmaEngineImpl implements GemmaEngine {
   /** Build an in-shader-quant matmul bind group. matmulQ8 and matmulQ4K share the
    *  layout (input, quants, scale-meta, output, params); pick the pipeline by mode. */
   private mmQuant(input: GPUBuffer, layer: Record<string, GPUBuffer>, key: string, output: GPUBuffer, params: GPUBuffer): GPUBindGroup {
-    const pipe = this.weightQuant === 'q4k' ? this.pipelines.matmulQ4K : this.pipelines.matmulQ8;
+    const pipe = this.weightQuant === 'q4k' ? this.pipelines.matmulQ4KMr : this.pipelines.matmulQ8;
     return this.device.createBindGroup({
       layout: pipe.getBindGroupLayout(0),
       entries: [
@@ -1817,15 +1829,15 @@ export class GemmaEngineImpl implements GemmaEngine {
       const isProducer = isKvProducerLayer(layerIdx, C);
       // Layer matmul weights are F16 (matmulQuant) or in-shader quant (Q8 / Q4_K).
       const mmPipe = this.weightQuant === 'q8' ? this.pipelines.matmulQ8
-        : this.weightQuant === 'q4k' ? this.pipelines.matmulQ4K
+        : this.weightQuant === 'q4k' ? this.pipelines.matmulQ4KMr
         : this.pipelines.matmulQuant;
       pass = this.beginPass(encoder, 'attn.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
       pass = this.beginPass(encoder, isProducer ? 'attn.linearQKV.producer' : 'attn.linearQ.consumer');
       pass.setPipeline(mmPipe);
-      pass.setBindGroup(0, lb.linearQ); this.dispatchMatmul(pass, Q);
+      pass.setBindGroup(0, lb.linearQ); this.dispatchMatmulRows(pass, Q);
       if (isProducer) {
-        pass.setBindGroup(0, lb.linearK); this.dispatchMatmul(pass, KV);
-        pass.setBindGroup(0, lb.linearV); this.dispatchMatmul(pass, KV);
+        pass.setBindGroup(0, lb.linearK); this.dispatchMatmulRows(pass, KV);
+        pass.setBindGroup(0, lb.linearV); this.dispatchMatmulRows(pass, KV);
       }
       pass.end();
       if (stopAt && 'layer' in stopAt && stopAt.layer === layerIdx) {
@@ -1859,7 +1871,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       pass = this.beginPass(encoder, 'attn.softmax'); pass.setPipeline(this.pipelines.softmax); pass.setBindGroup(0, lb.softmax); pass.dispatchWorkgroups(NQH); pass.end();
       pass = this.beginPass(encoder, 'attn.attnOutput'); pass.setPipeline(this.pipelines.attnOutput); pass.setBindGroup(0, lb.attnOutput); pass.dispatchWorkgroups(Math.ceil((NQH * HD) / 256)); pass.end();
       if (stopAt && stopAt.kind === 'attnOut' && stopAt.layer === layerIdx) return;
-      pass = this.beginPass(encoder, 'attn.linearOut'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.linearAttnOut); this.dispatchMatmul(pass, H); pass.end();
+      pass = this.beginPass(encoder, 'attn.linearOut'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.linearAttnOut); this.dispatchMatmulRows(pass, H); pass.end();
       // Post-attention residual. Gemma: norm(attnProj)+hidden (fused). Qwen3: plain hidden+attnProj.
       if (C.post_attn_norm === false) {
         pass = this.beginPass(encoder, 'attn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenAttnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
@@ -1877,14 +1889,14 @@ export class GemmaEngineImpl implements GemmaEngine {
       } else {
         // Scalar matmul fallback (always taken for q8 — mr4 is F16-only).
         pass.setPipeline(mmPipe);
-        pass.setBindGroup(0, lb.ffnGate); this.dispatchMatmul(pass, I);
-        pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmul(pass, I);
+        pass.setBindGroup(0, lb.ffnGate); this.dispatchMatmulRows(pass, I);
+        pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmulRows(pass, I);
       }
       pass.end();
       // FFN activation: Gemma tanh-GELU, Qwen3 SwiGLU/SiLU. Same bind-group layout.
       const actPipeline = C.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul;
       pass = this.beginPass(encoder, 'ffn.actMul'); pass.setPipeline(actPipeline); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
-      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmul(pass, H); pass.end();
+      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmulRows(pass, H); pass.end();
       // Post-FFN residual. Gemma: norm(ffnDown)+residual (fused). Qwen3: plain residual+ffnDown.
       if (C.post_ffn_norm === false) {
         pass = this.beginPass(encoder, 'ffn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenFfnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
