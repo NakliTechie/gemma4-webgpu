@@ -44,10 +44,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
   var acc2: f32 = 0.0;
   var acc3: f32 = 0.0;
 
-  let row0 = m0 * N;
-  let row1 = row0 + N;
-  let row2 = row1 + N;
-  let row3 = row2 + N;
+  // Clamp each row to a valid index so out-of-range rows (when M % 4 != 0, e.g.
+  // some attention projections) read in-bounds; their output is never written
+  // below. No-op for the FFN dims this was written for (M divisible by 4).
+  let row0 = min(m0, M - 1u) * N;
+  let row1 = min(m0 + 1u, M - 1u) * N;
+  let row2 = min(m0 + 2u, M - 1u) * N;
+  let row3 = min(m0 + 3u, M - 1u) * N;
 
   var k: u32 = tid;
   loop {

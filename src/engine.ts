@@ -93,6 +93,10 @@ export class GemmaEngineImpl implements GemmaEngine {
    * `true` selects the MR4 pipeline (4-row unrolled); `false` uses the
    * scalar matmulQuant path with `dispatchMatmul(I)`. */
   private mr4ForFfn!: boolean;
+  /** Output rows produced per workgroup by the active layer-matmul kernel: 4 for
+   *  the multi-row kernels (q4k/q8 MR always; f16 when mr4 is enabled), else 1
+   *  for the scalar path. Drives `dispatchMatmulRows` (ceil(M/rows) workgroups). */
+  private matmulRowsPerWg = 1;
   /** Weight storage for the layer matmul weights. 'f16' (default) dequantizes
    *  to F16 at load; 'q8' keeps them as in-shader Q8_0 (int8 + per-32-block f16
    *  scale) for ~2× less GPU memory; 'q4k' keeps them as in-shader 4-bit
@@ -219,8 +223,13 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.tuningReason = selected.reason;
     this.mr4ForFfn = rowsPerWorkgroupFor(this.tuning, 'ffn.linearGateUp') >= 4;
     this.weightQuant = options.weightQuant ?? 'f16';
-    // The in-shader quant matmuls are scalar GEMVs; the F16 MR4 fast-path doesn't apply.
-    if (this.weightQuant !== 'f16') this.mr4ForFfn = false;
+    // Rows-per-workgroup for the active layer-matmul kernel. q4k/q8 ship their own
+    // multi-row (R=4) kernels; f16 uses matmulQuantMR4 (R=4) when the profile
+    // enables it, else the scalar 1-row path. mr4ForFfn stays meaningful only for
+    // the f16 FFN bind-group layout choice (MR4 ≡ matmulQuant layout either way).
+    this.matmulRowsPerWg =
+      this.weightQuant === 'q4k' || this.weightQuant === 'q8' ? 4
+        : this.mr4ForFfn ? 4 : 1;
     // Log the decision for post-hoc diagnosis of unexpectedly-low tps
     // on hardware the profile registry doesn't yet know about.
     console.log(
@@ -367,8 +376,7 @@ export class GemmaEngineImpl implements GemmaEngine {
    * overflow scheme applies to the workgroup count.
    */
   private dispatchMatmulRows(pass: GPUComputePassEncoder, M: number): void {
-    const R = this.weightQuant === 'q4k' ? 4 : 1;
-    this.dispatchMatmul(pass, Math.ceil(M / R));
+    this.dispatchMatmul(pass, Math.ceil(M / this.matmulRowsPerWg));
   }
 
   private reportProgress(
@@ -706,7 +714,7 @@ export class GemmaEngineImpl implements GemmaEngine {
   /** Build an in-shader-quant matmul bind group. matmulQ8 and matmulQ4K share the
    *  layout (input, quants, scale-meta, output, params); pick the pipeline by mode. */
   private mmQuant(input: GPUBuffer, layer: Record<string, GPUBuffer>, key: string, output: GPUBuffer, params: GPUBuffer): GPUBindGroup {
-    const pipe = this.weightQuant === 'q4k' ? this.pipelines.matmulQ4KMr : this.pipelines.matmulQ8;
+    const pipe = this.weightQuant === 'q4k' ? this.pipelines.matmulQ4KMr : this.pipelines.matmulQ8Mr;
     return this.device.createBindGroup({
       layout: pipe.getBindGroupLayout(0),
       entries: [
@@ -1828,8 +1836,12 @@ export class GemmaEngineImpl implements GemmaEngine {
       const KV = NKH * HD;
       const isProducer = isKvProducerLayer(layerIdx, C);
       // Layer matmul weights are F16 (matmulQuant) or in-shader quant (Q8 / Q4_K).
-      const mmPipe = this.weightQuant === 'q8' ? this.pipelines.matmulQ8
+      // Per-mode multi-row matmul: f16 → MR4 (when the profile enables it),
+      // q8 → Q8 MR, q4k → Q4_K MR. All share their scalar counterpart's bind
+      // layout, so the cached bind groups work unchanged.
+      const mmPipe = this.weightQuant === 'q8' ? this.pipelines.matmulQ8Mr
         : this.weightQuant === 'q4k' ? this.pipelines.matmulQ4KMr
+        : this.mr4ForFfn ? this.pipelines.matmulQuantMR4
         : this.pipelines.matmulQuant;
       pass = this.beginPass(encoder, 'attn.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.attnNorm); pass.dispatchWorkgroups(1); pass.end();
       pass = this.beginPass(encoder, isProducer ? 'attn.linearQKV.producer' : 'attn.linearQ.consumer');
@@ -1879,19 +1891,12 @@ export class GemmaEngineImpl implements GemmaEngine {
         pass = this.beginPass(encoder, 'attn.postNormAdd'); pass.setPipeline(this.pipelines.fusedNormAdd); pass.setBindGroup(0, lb.fusedPostAttnNormAdd); pass.dispatchWorkgroups(1); pass.end();
       }
       pass = this.beginPass(encoder, 'ffn.rmsNorm'); pass.setPipeline(this.pipelines.rmsNorm); pass.setBindGroup(0, lb.ffnNorm); pass.dispatchWorkgroups(1); pass.end();
+      // Unified: mmPipe is the right kernel per mode (f16 MR4 / q8 MR / q4k MR /
+      // scalar), and dispatchMatmulRows issues ceil(I/rows) workgroups.
       pass = this.beginPass(encoder, 'ffn.linearGateUp');
-      if (this.mr4ForFfn) {
-        // matmulQuantMR4 produces 4 output rows per workgroup; dispatch I/4 wgs.
-        // I is per-layer (6144 or 12288 on Gemma 4 E2B), both divisible by 4.
-        pass.setPipeline(this.pipelines.matmulQuantMR4);
-        pass.setBindGroup(0, lb.ffnGate); pass.dispatchWorkgroups(I >> 2, 1, 1);
-        pass.setBindGroup(0, lb.ffnUp); pass.dispatchWorkgroups(I >> 2, 1, 1);
-      } else {
-        // Scalar matmul fallback (always taken for q8 — mr4 is F16-only).
-        pass.setPipeline(mmPipe);
-        pass.setBindGroup(0, lb.ffnGate); this.dispatchMatmulRows(pass, I);
-        pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmulRows(pass, I);
-      }
+      pass.setPipeline(mmPipe);
+      pass.setBindGroup(0, lb.ffnGate); this.dispatchMatmulRows(pass, I);
+      pass.setBindGroup(0, lb.ffnUp); this.dispatchMatmulRows(pass, I);
       pass.end();
       // FFN activation: Gemma tanh-GELU, Qwen3 SwiGLU/SiLU. Same bind-group layout.
       const actPipeline = C.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul;

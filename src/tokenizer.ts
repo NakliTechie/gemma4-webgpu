@@ -73,10 +73,13 @@ export class Tokenizer {
     }
     this.buildTokenIndex();
 
-    // Byte-level BPE (Qwen3 etc.) is signalled by the presence of merge rules,
-    // which SentencePiece (Gemma) GGUFs don't carry.
+    // Byte-level BPE (Qwen3 / gpt2) vs SentencePiece (Gemma) is decided by the
+    // llama.cpp tokenizer model name. NOT by merge presence — Gemma 4 GGUFs carry
+    // a `merges` array yet are SentencePiece (their vocab uses ▁, e.g. "▁The"),
+    // so keying off merges mis-routes Gemma to byte-level and mangles it.
+    const tokModel = gguf.kv.get('tokenizer.ggml.model')?.value;
     const merges = kvArray(gguf, 'tokenizer.ggml.merges') as string[] | null;
-    if (merges && merges.length > 0) {
+    if (tokModel === 'gpt2' && merges && merges.length > 0) {
       this.mode = 'bpe';
       this.byteEncoder = bytesToUnicode();
       for (const [b, c] of this.byteEncoder) this.byteDecoder.set(c, b);
