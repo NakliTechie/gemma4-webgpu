@@ -57,7 +57,8 @@ export function defaultDeepseekOcrConfig(): GemmaConfig {
     rope_theta_swa: 10000.0,
     head_dim_local: head_dim,
     head_dim_global: head_dim,
-    sliding_window: 0,                      // P0: full causal (≡ R-SWA ≤128 tokens out)
+    sliding_window: 0,                      // Gemma-style mask SWA unused (R-SWA ≠ mask SWA)
+    ring_window: 128,                       // R-SWA ring (HF sliding_window_size; no GGUF key)
     attention_is_sliding: new Array<boolean>(num_layers).fill(false),
     intermediate_sizes,
     num_unshared_layers: num_layers,

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Unlimited-OCR — long-doc R-SWA ring (P2)</title>
+  <style>
+    body { font-family: ui-monospace, monospace; margin: 24px; background: #101214; color: #d6d8da; }
+    h1 { font-size: 15px; }
+    .pages { display: flex; gap: 8px; }
+    .pages canvas { border: 1px solid #333; width: 220px; height: 220px; background: #fff; }
+    #status { margin: 12px 0; color: #7ad17a; white-space: pre-wrap; }
+    #out { white-space: pre-wrap; border: 1px solid #333; padding: 12px; max-width: 980px; }
+    #metrics { color: #9ab8ff; white-space: pre-wrap; margin: 10px 0; }
+  </style>
+</head>
+<body>
+  <h1>Unlimited-OCR — multi-page one-shot parse with constant-memory ring KV (drive via <code>window.longdoc.run()</code>)</h1>
+  <div class="pages">
+    <canvas id="p0" width="1024" height="1024"></canvas>
+    <canvas id="p1" width="1024" height="1024"></canvas>
+    <canvas id="p2" width="1024" height="1024"></canvas>
+  </div>
+  <div id="status">idle</div>
+  <div id="metrics"></div>
+  <div id="out"></div>
+  <script type="module" src="/workbench/longdoc-demo.ts"></script>
+</body>
+</html>
