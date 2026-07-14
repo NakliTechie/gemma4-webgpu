@@ -13,16 +13,20 @@ import { createGemmaEngine } from '../src/index.js';
 import type { GemmaEngine } from '../src/index.js';
 
 const MODEL_URL = '/models/Unlimited-OCR-Q4_K_M.gguf';
-const VISION_URL = '/models/onnx/deepencoder_fp32.onnx';
-const EXTRAS_URL = '/models/onnx/deepencoder_extras.npz';
+const VISION_SEQ_URL = '/models/longdoc/vision_seq.npz';
 const CONTROL_URL = '/models/longdoc/hf_ring_control.json';
 const PAGE_URLS = ['/models/longdoc/page_1.png', '/models/longdoc/page_2.png', '/models/longdoc/page_3.png'];
-const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/ort.webgpu.min.mjs';
-
 const BOS = 0, EOS = 1, H = 1280, GRID = 16;
 const CTX = 1024; // deliberately smaller than prefix+output — the ring makes it enough
 
-const say = (s: string) => { document.getElementById('status')!.textContent = s; console.log('[longdoc]', s); };
+const say = (s: string) => {
+  document.getElementById('status')!.textContent = s;
+  console.log('[longdoc]', s);
+  try { localStorage.setItem('longdoc_stage', s); } catch { /* quota */ }
+};
+// Surface where a crashed previous run died (localStorage survives reloads).
+const prev = localStorage.getItem('longdoc_stage');
+if (prev) console.warn('[longdoc] previous run last stage:', prev);
 const metrics = (s: string) => { document.getElementById('metrics')!.textContent = s; };
 
 async function drawPage(idx: number, url: string): Promise<void> {
@@ -82,26 +86,16 @@ const longdoc: LongDoc = {
     this.ctl = await (await fetch(CONTROL_URL)).json() as Ctl;
     for (let i = 0; i < PAGE_URLS.length; i++) await drawPage(i, PAGE_URLS[i]);
 
-    say('vision: loading DeepEncoder ONNX…');
-    const ort = await import(/* @vite-ignore */ ORT_URL);
-    ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/';
-    const sess = await ort.InferenceSession.create(VISION_URL, { executionProviders: ['webgpu', 'wasm'] });
+    // Vision embeds come PRECOMPUTED from the python control (same tensors on
+    // both sides — a stronger comparison, and it keeps the 1.6 GB fp32 ORT
+    // session out of this tab: running it before the 2 GB decoder load was
+    // crashing the renderer (3× silent page reloads, no vite trigger). In-tab
+    // vision itself is already proven by the P1 single-page demo.
+    say('vision: loading precomputed embeds (python control parity input)…');
     const { loadReferenceTensors } = await import('../src/diagnostics/index.js');
-    const { tensors } = await loadReferenceTensors(EXTRAS_URL);
-    const newline = tensors['image_newline'] as Float32Array;
-    const seperator = tensors['view_seperator'] as Float32Array;
-
-    const blocks: Float32Array[] = [];
-    for (let i = 0; i < PAGE_URLS.length; i++) {
-      const t0 = performance.now();
-      const r = await sess.run({ pixel_values: new ort.Tensor('float32', preprocess(i), [1, 3, 1024, 1024]) });
-      blocks.push(splicePage(r.vision_embeds.data as Float32Array, newline, seperator));
-      say(`vision: page ${i + 1}/${PAGE_URLS.length} in ${(performance.now() - t0).toFixed(0)} ms`);
-    }
-    const total = blocks.reduce((a, b) => a + b.length, 0);
-    const seq = new Float32Array(total);
-    let o = 0; for (const b of blocks) { seq.set(b, o); o += b.length; }
-    this.visionSeq = seq;
+    const { tensors } = await loadReferenceTensors(VISION_SEQ_URL);
+    this.visionSeq = tensors['vision_seq'] as Float32Array;
+    say(`vision: ${this.visionSeq.length / H} embed rows loaded`);
 
     if (!this.engine) {
       say(`decoder: loading (contextLength=${CTX} — smaller than prefix+output on purpose)…`);

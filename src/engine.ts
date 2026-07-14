@@ -2468,6 +2468,10 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.cpuProfileCapturing = false;
     for (let i = 0; i < tokens.length; i++) {
       this.forwardPassOnly(tokens[i], startPos + i);
+      // Long prefills (800+ positions on the OCR path) crash the GPU process
+      // if every command buffer is queued without a sync point — bound the
+      // in-flight queue depth.
+      if ((i & 63) === 63) await this.device.queue.onSubmittedWorkDone();
     }
     await this.device.queue.onSubmittedWorkDone();
     this.profileCapturing = wasCapturing;
@@ -2874,6 +2878,8 @@ export class GemmaEngineImpl implements GemmaEngine {
       const encoder = this.device.createCommandEncoder();
       this.encodeTransformerPass(encoder, null, startPos + i, undefined, true);
       this.device.queue.submit([encoder.finish()]);
+      // Bound queue depth on long multimodal prefills (see prefillBatched).
+      if ((i & 63) === 63) await this.device.queue.onSubmittedWorkDone();
     }
     await this.device.queue.onSubmittedWorkDone();
     this.profileCapturing = wasCapturing;
