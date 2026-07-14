@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Unlimited-OCR — real PDF, one-shot, in-tab (P2 showpiece)</title>
+  <style>
+    body { font-family: ui-monospace, monospace; margin: 24px; background: #101214; color: #d6d8da; }
+    h1 { font-size: 15px; }
+    #pages { display: flex; gap: 8px; flex-wrap: wrap; }
+    #pages canvas { border: 1px solid #333; width: 180px; height: 180px; background: #fff; }
+    #status { margin: 12px 0; color: #7ad17a; white-space: pre-wrap; }
+    #metrics { color: #9ab8ff; white-space: pre-wrap; margin: 10px 0; }
+    #out { white-space: pre-wrap; border: 1px solid #333; padding: 12px; max-width: 980px; }
+  </style>
+</head>
+<body>
+  <h1>Real PDF → pdf.js → DeepEncoder (in-tab) → ring-KV MoE decoder. Everything client-side. (<code>window.pdfdemo.run()</code>)</h1>
+  <div id="pages"></div>
+  <div id="status">idle</div>
+  <div id="metrics"></div>
+  <div id="out"></div>
+  <script type="module" src="/workbench/pdf-demo.ts"></script>
+</body>
+</html>
