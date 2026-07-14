@@ -2821,6 +2821,10 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.kvPosition = 0;
   }
 
+  decodeTokens(tokenIds: number[]): string {
+    return this.tokenizer.decodeTokens(tokenIds);
+  }
+
   /**
    * Prefill from PRECOMPUTED embeddings instead of token ids — the
    * inputs_embeds injection path for multimodal prefixes (vision tokens from

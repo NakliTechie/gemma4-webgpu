@@ -402,6 +402,8 @@ export interface GemmaEngine {
   captureHidden(tokenId: number, position: number, stopAt: CapturePoint): Promise<Float32Array>;
   /** Tokenize a prompt for capture-path prefill. Exposes the engine's tokenizer. */
   encodePromptTokens(text: string, applyChatTemplate: boolean): number[];
+  /** Detokenize ids → text. Exposes the engine's tokenizer (raw decode, no cleanup). */
+  decodeTokens(tokenIds: number[]): string;
   /** Prefill a contiguous token range starting at `startPos` without sampling. */
   prefillForCapture(tokens: number[], startPos: number): Promise<void>;
   /**

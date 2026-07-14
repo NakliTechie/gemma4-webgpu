@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Unlimited-OCR — browser-native e2e (P1 smoke)</title>
+  <style>
+    body { font-family: ui-monospace, monospace; margin: 24px; background: #101214; color: #d6d8da; }
+    h1 { font-size: 16px; }
+    #doc { border: 1px solid #333; width: 512px; height: 512px; image-rendering: auto; background: #fff; }
+    #status { margin: 12px 0; color: #7ad17a; white-space: pre-wrap; }
+    #out { white-space: pre-wrap; border: 1px solid #333; padding: 12px; min-height: 80px; max-width: 900px; }
+    .row { display: flex; gap: 24px; align-items: flex-start; }
+  </style>
+</head>
+<body>
+  <h1>Unlimited-OCR — vision→decoder e2e on WebGPU (agent instrument; drive via <code>window.ocr</code>)</h1>
+  <div class="row">
+    <canvas id="doc" width="1024" height="1024"></canvas>
+    <div style="flex:1">
+      <div id="status">idle — call ocr.run()</div>
+      <div id="out"></div>
+    </div>
+  </div>
+  <script type="module" src="/workbench/ocr-demo.ts"></script>
+</body>
+</html>
