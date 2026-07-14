@@ -60,6 +60,10 @@ export class Tokenizer {
   private byteDecoder: Map<string, number> = new Map();
   private bpeRanks: Map<string, number> = new Map();
   private addBos = false;
+  /** BOS id from `tokenizer.ggml.bos_token_id`. Preferred over name lookup —
+   *  BOS spelling varies by family (Qwen `<|endoftext|>`, DeepSeek
+   *  `<｜begin▁of▁sentence｜>`), the metadata id doesn't. */
+  private bosTokenId: number | null = null;
   // Qwen2/gpt2 pre-tokenizer split (\p{L}/\p{N} need the `u` flag).
   private bpePat = /'(?:[sS]|[tT]|[rR][eE]|[vV][eE]|[mM]|[lL][lL]|[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
 
@@ -90,6 +94,8 @@ export class Tokenizer {
       }
       const addBos = gguf.kv.get('tokenizer.ggml.add_bos_token')?.value;
       this.addBos = addBos === true;
+      const bosId = gguf.kv.get('tokenizer.ggml.bos_token_id')?.value;
+      this.bosTokenId = typeof bosId === 'number' ? bosId : null;
       this.initBpeSpecials();
     } else {
       this.mode = 'spm';
@@ -188,7 +194,13 @@ export class Tokenizer {
 
   private encodeBpe(text: string): number[] {
     const tokens: number[] = [];
-    if (this.addBos) { const bos = this.specialTokens['<|endoftext|>']; if (bos !== undefined) tokens.push(bos); }
+    if (this.addBos) {
+      // Prefer the GGUF's explicit bos_token_id; fall back to the Qwen-style
+      // named special. (Bug found on Unlimited-OCR: add_bos=true + DeepSeek's
+      // BOS spelling meant the name lookup missed and BOS was silently dropped.)
+      const bos = this.bosTokenId ?? this.specialTokens['<|endoftext|>'];
+      if (bos !== undefined && bos !== null) tokens.push(bos);
+    }
     const special = new RegExp(this.specialPatternRegex.source, 'g');
     let lastIdx = 0, match: RegExpExecArray | null;
     while ((match = special.exec(text)) !== null) {
