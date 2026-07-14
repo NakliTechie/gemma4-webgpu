@@ -138,15 +138,25 @@ def greedy(ring: bool, max_new: int):
     embeds = model.model.embed_tokens(torch.tensor([ids]))
     embeds[0, 1:1 + n_img] = vision_seq.to(torch.bfloat16)
     past, cur, out = None, embeds, []
+    # TRUE absolute positions, explicitly. With the ring, the cache length
+    # plateaus at P+W — HF's default position derivation (from cache length)
+    # would freeze RoPE right after the wrap and collapse generation (observed:
+    # perfect page-1 transcription, then repetition garbage at step ~137).
+    # generate() avoids this via attention-mask cumsum; we pass positions
+    # directly. This matches the engine, which always ropes true positions.
+    pos = torch.arange(len(ids))[None]
+    abs_pos = len(ids)
     with torch.no_grad():
         for step in range(max_new):
-            o = model(inputs_embeds=cur, use_cache=True, past_key_values=past)
+            o = model(inputs_embeds=cur, use_cache=True, past_key_values=past, position_ids=pos)
             past = o.past_key_values
             nxt = int(o.logits[0, -1].argmax())
             if nxt == EOS:
                 break
             out.append(nxt)
             cur = model.model.embed_tokens(torch.tensor([[nxt]]))
+            pos = torch.tensor([[abs_pos]])
+            abs_pos += 1
     return out
 
 print(f"[{time.time()-t0:.1f}s] seq len={len(ids)} (P={len(ids)-len(prompt_ids)+len(prompt_ids)}) — RING greedy…")
