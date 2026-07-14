@@ -1,0 +1,34 @@
+{
+  "model": "baidu/Unlimited-OCR (language decoder only)",
+  "prompt": "The capital of France is",
+  "tokens": [
+    0,
+    671,
+    6102,
+    294,
+    8760,
+    344
+  ],
+  "position": 5,
+  "num_layers": 12,
+  "keys": [
+    "afterLayer_00_pos14",
+    "afterLayer_01_pos14",
+    "afterLayer_02_pos14",
+    "afterLayer_03_pos14",
+    "afterLayer_04_pos14",
+    "afterLayer_05_pos14",
+    "afterLayer_06_pos14",
+    "afterLayer_07_pos14",
+    "afterLayer_08_pos14",
+    "afterLayer_09_pos14",
+    "afterLayer_10_pos14",
+    "afterLayer_11_pos14",
+    "embed_pos14",
+    "final_pos14",
+    "logits_pos14",
+    "position",
+    "tokens"
+  ],
+  "note": "afterLayer_LL = residual after layer LL (pre-final-norm); final = post-final-norm; logits = lm_head(final), no softcap. Full-causal (no R-SWA ring) \u2014 matches engine P0. bf16 CPU forward, transformers 4.46.3, vendored Baidu modeling code (mha_eager)."
+}
