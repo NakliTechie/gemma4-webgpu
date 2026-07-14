@@ -1933,6 +1933,7 @@ export class GemmaEngineImpl implements GemmaEngine {
     tokenId: number | null,
     position: number,
     stopAt?: CapturePoint,
+    skipEmbed = false,
   ): void {
     const C = this.config;
     const H = C.hidden_size;
@@ -1977,11 +1978,15 @@ export class GemmaEngineImpl implements GemmaEngine {
 
     let pass: GPUComputePassEncoder;
 
-    pass = this.beginPass(encoder, 'embed');
-    pass.setPipeline(this.pipelines.embeddingLookup);
-    pass.setBindGroup(0, this.bindGroupCache.embeddingLookup);
-    pass.dispatchWorkgroups(Math.ceil(H / 256));
-    pass.end();
+    // skipEmbed: the caller pre-wrote workBuffers.hidden (inputs_embeds
+    // injection — vision tokens arrive as embeddings, not token ids).
+    if (!skipEmbed) {
+      pass = this.beginPass(encoder, 'embed');
+      pass.setPipeline(this.pipelines.embeddingLookup);
+      pass.setBindGroup(0, this.bindGroupCache.embeddingLookup);
+      pass.dispatchWorkgroups(Math.ceil(H / 256));
+      pass.end();
+    }
 
     if (stopAt?.kind === 'embed') return;
 
@@ -2814,6 +2819,40 @@ export class GemmaEngineImpl implements GemmaEngine {
   resetKVForCapture(): void {
     this.resetKVCaches();
     this.kvPosition = 0;
+  }
+
+  /**
+   * Prefill from PRECOMPUTED embeddings instead of token ids — the
+   * inputs_embeds injection path for multimodal prefixes (vision tokens from
+   * an external encoder). `embeds` is row-major [n, hidden_size] F32; rows
+   * are fed at positions startPos..startPos+n-1. Values are used raw (no
+   * embedding_scale — matches HF's masked_scatter AFTER the scaled lookup;
+   * only relevant on arches with embedding_scale ≠ 1). Composes with
+   * prefillForCapture for interleaved text/vision sequences.
+   */
+  async prefillEmbedsForCapture(embeds: Float32Array, startPos: number): Promise<void> {
+    const H = this.config.hidden_size;
+    if (embeds.length % H !== 0) {
+      throw new Error(`prefillEmbedsForCapture: embeds length ${embeds.length} not a multiple of hidden_size ${H}`);
+    }
+    const nRows = embeds.length / H;
+    if (nRows === 0) return;
+    const wasCapturing = this.profileCapturing;
+    const wasCpuCapturing = this.cpuProfileCapturing;
+    this.profileCapturing = false;
+    this.cpuProfileCapturing = false;
+    for (let i = 0; i < nRows; i++) {
+      // queue.writeBuffer is ordered before subsequently-submitted command
+      // buffers, so each forward sees its own row in `hidden`.
+      this.wb(this.workBuffers.hidden, 0, embeds.subarray(i * H, (i + 1) * H));
+      const encoder = this.device.createCommandEncoder();
+      this.encodeTransformerPass(encoder, null, startPos + i, undefined, true);
+      this.device.queue.submit([encoder.finish()]);
+    }
+    await this.device.queue.onSubmittedWorkDone();
+    this.profileCapturing = wasCapturing;
+    this.cpuProfileCapturing = wasCpuCapturing;
+    this.kvPosition = startPos + nRows;
   }
 
   async captureEmbedSliceAll(tokenId: number): Promise<Float32Array[]> {

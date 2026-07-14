@@ -404,6 +404,12 @@ export interface GemmaEngine {
   encodePromptTokens(text: string, applyChatTemplate: boolean): number[];
   /** Prefill a contiguous token range starting at `startPos` without sampling. */
   prefillForCapture(tokens: number[], startPos: number): Promise<void>;
+  /**
+   * Prefill from precomputed embeddings ([n, hidden_size] F32, row-major) at
+   * positions startPos..startPos+n-1 — the inputs_embeds injection path for
+   * vision tokens. Composes with prefillForCapture for interleaved sequences.
+   */
+  prefillEmbedsForCapture(embeds: Float32Array, startPos: number): Promise<void>;
   /** Reset KV caches without clearing conversation history. */
   resetKVForCapture(): void;
   /**
