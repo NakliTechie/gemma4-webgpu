@@ -69,8 +69,11 @@ export interface GemmaConfig {
    * Model family discriminator. `undefined`/`'gemma4'` selects the original
    * Gemma 4 path (PLE on, 4-norm sandwich, V-norm, GELU, √hidden embed scale).
    * `'qwen3'` selects the simplified path gated by the flags below.
+   * `'deepseek-ocr'` = Unlimited-OCR / DeepSeek-OCR decoder: the Qwen3 path
+   * minus per-head QK-norm (`qk_norm:false` ⇒ plain Llama MHA + RoPE), plus a
+   * DeepSeek-V2 MoE FFN on layers ≥ `moe.first_dense_layers`.
    */
-  arch?: 'gemma4' | 'qwen3';
+  arch?: 'gemma4' | 'qwen3' | 'deepseek-ocr';
   /** FFN activation. Undefined ⇒ 'gelu' (Gemma). Qwen3: 'silu' (SwiGLU). */
   ffn_activation?: 'gelu' | 'silu';
   /** Per-KV-head V-norm before cache store. Undefined ⇒ true (Gemma). Qwen3: false. */
@@ -89,6 +92,37 @@ export interface GemmaConfig {
    * tied embeddings (reuse token_embd as the LM head). Qwen3 4B/8B: 'output'.
    */
   lm_head_tensor?: string;
+  /**
+   * Per-head Q/K RMSNorm before RoPE. Undefined ⇒ true (Gemma 4 and Qwen3
+   * both have learned q_norm/k_norm). deepseek-ocr: false — plain RoPE on the
+   * raw q/k projections (Llama attention, no norm).
+   */
+  qk_norm?: boolean;
+  /**
+   * DeepSeek-V2-style MoE FFN. Undefined ⇒ dense FFN everywhere. When set,
+   * layers < `first_dense_layers` keep the dense FFN (`ffn_gate/up/down`);
+   * later layers run a shared-expert FFN (`ffn_*_shexp`, pre-fused across the
+   * shared experts in the GGUF, ungated — routed through the standard dense
+   * FFN path via tensor aliasing) PLUS a softmax-router top-k over
+   * `num_experts` routed experts (`ffn_*_exps`, packed [expert][rows][cols]).
+   * Routed weights = raw softmax probs unless `norm_topk_prob`, then
+   * × `routed_scaling_factor`. (Unlimited-OCR: softmax, greedy top-6 of 64,
+   * norm_topk_prob=false, scale=1.0 — HF configuration_deepseek_v2 defaults.)
+   */
+  moe?: {
+    num_experts: number;              // Unlimited-OCR: 64
+    experts_per_tok: number;          // 6
+    moe_intermediate_size: number;    // 896 (per routed expert)
+    shared_intermediate_size: number; // 1792 (2 shared experts × 896, fused)
+    first_dense_layers: number;       // 1 (first_k_dense_replace)
+    norm_topk_prob: boolean;          // false
+    routed_scaling_factor: number;    // 1.0
+  };
+}
+
+/** True if layer `il` runs the MoE FFN (routed + shared experts). */
+export function isMoELayer(il: number, config: GemmaConfig): boolean {
+  return config.moe !== undefined && il >= config.moe.first_dense_layers;
 }
 
 /** True if layer `il` uses sliding-window (LOCAL) attention. */
@@ -563,6 +597,13 @@ export interface WorkBuffers {
   pleProjOut: GPUBuffer;
   /** Stage 2 step d: `post_norm(pleProjOut)`. `[hidden_size]` F32. Reused. */
   plePostNormed: GPUBuffer;
+  // MoE work buffers (deepseek-ocr only; undefined otherwise).
+  /** Router logits: `ffn_gate_inp @ normed` → `[num_experts]` F32. Reused across layers. */
+  moeRouterLogits?: GPUBuffer;
+  /** Top-k selection: `[k]` expert ids (u32) followed by `[k]` gate weights (f32 bitcast). Written by moeTopk. */
+  moeSel?: GPUBuffer;
+  /** Per-slot expert down-proj outputs: `[experts_per_tok × hidden_size]` F32. */
+  moeSlots?: GPUBuffer;
 }
 
 export interface KVCache {
@@ -592,6 +633,20 @@ export interface UniformBuffers {
   pleGeluMulParams: GPUBuffer[];
   /** Stage 2 skip_scale_add params (size = hidden_size). Shared across layers. */
   pleSkipScaleAdd: GPUBuffer;
+  // MoE uniforms (deepseek-ocr only). Shared across MoE layers — the shapes
+  // are identical for every routed layer.
+  /** matmulQuant params for the router: `{ M: num_experts, N: hidden_size }`. */
+  moeRouterMM?: GPUBuffer;
+  /** moeTopk params: `{ n: num_experts, k: experts_per_tok, norm: 0|1, scale: f32 }`. */
+  moeTopkParams?: GPUBuffer;
+  /** Expert gate/up matmul params: `{ M: moe_I, N: hidden, rows_per_expert: moe_I, input_per_slot: 0 }`. */
+  moeGateUpMM?: GPUBuffer;
+  /** Expert down matmul params: `{ M: hidden, N: moe_I, rows_per_expert: hidden, input_per_slot: 1 }`. */
+  moeDownMM?: GPUBuffer;
+  /** siluMul size for the batched expert activation: `experts_per_tok × moe_I`. */
+  sizeMoeAct?: GPUBuffer;
+  /** moeAccum params: `{ h: hidden_size, k: experts_per_tok }`. */
+  moeAccumParams?: GPUBuffer;
 
   // Per-layer uniforms. Populated per layer using `getHeadDim(il)` and
   // `getIntermediateSize(il)`, since LOCAL/GLOBAL layers have head_dim
@@ -658,6 +713,17 @@ export interface LayerBindGroups {
   // Qwen3 pre-norm residual adds (plain `add`, no post-block norm).
   qwenAttnAdd: GPUBindGroup;
   qwenFfnAdd: GPUBindGroup;
+  // MoE bind groups (deepseek-ocr routed layers only; undefined otherwise).
+  // The shared-expert FFN reuses the standard ffnGate/ffnUp/geluMul/ffnDown
+  // groups above via tensor aliasing (`ffn_*_shexp` uploaded under the dense
+  // keys), so only the routed-expert pipeline needs new groups.
+  moeRouter?: GPUBindGroup;
+  moeTopk?: GPUBindGroup;
+  moeGateExp?: GPUBindGroup;
+  moeUpExp?: GPUBindGroup;
+  moeActMul?: GPUBindGroup;
+  moeDownExp?: GPUBindGroup;
+  moeAccum?: GPUBindGroup;
   // PLE Stage 2 bind groups. Populated for every layer.
   pleInpGateMatmul: GPUBindGroup;
   pleGeluMul: GPUBindGroup;

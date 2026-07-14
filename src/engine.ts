@@ -4,6 +4,7 @@ import { Tokenizer } from './tokenizer.js';
 import { buildChatPrompt } from './conversation.js';
 import { defaultConfig, configFromGGUF } from './config/gemma4-e2b.js';
 import { configFromGGUFQwen3 } from './config/qwen3-4b.js';
+import { configFromGGUFDeepseekOcr } from './config/deepseek-ocr.js';
 import { selectDeviceProfile, rowsPerWorkgroupFor, type TuningProfile } from './tuning/index.js';
 import { RangedReader } from './ranged-reader.js';
 import {
@@ -12,6 +13,7 @@ import {
   getIntermediateSize,
   isSwaLayer,
   isKvProducerLayer,
+  isMoELayer,
   type GemmaConfig,
   type GemmaEngine,
   type GemmaEngineOptions,
@@ -251,9 +253,11 @@ export class GemmaEngineImpl implements GemmaEngine {
 
       const parser = new GGUFParser(headerBuf);
       const gguf = parser.parse();
-      this.config = gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
-        ? configFromGGUFQwen3(gguf, options.contextLength)
-        : configFromGGUF(gguf, options.contextLength);
+      this.config = gguf.kv.has('deepseek2-ocr.block_count')
+        ? configFromGGUFDeepseekOcr(gguf, options.contextLength)
+        : gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
+          ? configFromGGUFQwen3(gguf, options.contextLength)
+          : configFromGGUF(gguf, options.contextLength);
 
       this.tokenizer = new Tokenizer();
       this.tokenizer.extractFromGGUF(gguf);
@@ -293,9 +297,11 @@ export class GemmaEngineImpl implements GemmaEngine {
 
       const parser = new GGUFParser(buffer);
       const gguf = parser.parse();
-      this.config = gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
-        ? configFromGGUFQwen3(gguf, options.contextLength)
-        : configFromGGUF(gguf, options.contextLength);
+      this.config = gguf.kv.has('deepseek2-ocr.block_count')
+        ? configFromGGUFDeepseekOcr(gguf, options.contextLength)
+        : gguf.kv.has('qwen3.block_count') || gguf.kv.has('qwen3.embedding_length')
+          ? configFromGGUFQwen3(gguf, options.contextLength)
+          : configFromGGUF(gguf, options.contextLength);
 
       this.tokenizer = new Tokenizer();
       this.tokenizer.extractFromGGUF(gguf);
@@ -320,7 +326,8 @@ export class GemmaEngineImpl implements GemmaEngine {
     // (PLE) with a positive per_layer_input_dim. The forward pass and the
     // bind-group layout assume PLE is always active, so fail loud if the
     // GGUF metadata somehow yields 0 — cleaner than silent wrong output.
-    if (this.config.arch !== 'qwen3' && this.config.per_layer_input_dim === 0) {
+    const hasPle = this.config.arch === undefined || this.config.arch === 'gemma4';
+    if (hasPle && this.config.per_layer_input_dim === 0) {
       throw new Error(
         'per_layer_input_dim = 0 — this engine is Gemma-4-E2B-specific and requires PLE. ' +
         'Check that the GGUF is a Gemma 4 variant.',
@@ -549,7 +556,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       // 1/sqrt(head_dim) despite also having QK-norm (HF `Qwen3Attention.scaling
       // = head_dim**-0.5`); using 1.0 there makes softmax inputs ~sqrt(128)×
       // too large → attention collapses to one token → degenerate repetition.
-      const attnScaling = C.arch === 'qwen3' ? 1.0 / Math.sqrt(HD) : 1.0;
+      const attnScaling = (C.arch === 'qwen3' || C.arch === 'deepseek-ocr') ? 1.0 / Math.sqrt(HD) : 1.0;
       this.uniformBuffers.attnScore.push(
         this.makeUniformMixed([
           { u: NQH }, { u: NKH }, { u: HD },
@@ -564,7 +571,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       // pairs). LOCAL layers use plain 1/pow(theta, ...) schedule with no divisor.
       // Qwen3 uses plain RoPE (theta 1e6, no divisor table) on every layer.
       // Gemma applies the rope_freqs divisor on GLOBAL (full-attention) layers only.
-      const applyDivisor = C.arch === 'qwen3' ? 0 : (isSwaLayer(il, C) ? 0 : 1);
+      const applyDivisor = (C.arch === 'qwen3' || C.arch === 'deepseek-ocr') ? 0 : (isSwaLayer(il, C) ? 0 : 1);
       this.uniformBuffers.ropeQ.push(
         this.makeUniformMixed([{ u: NQH }, { u: HD }, { u: 0 }, { f: theta }])
       );
@@ -583,6 +590,24 @@ export class GemmaEngineImpl implements GemmaEngine {
       this.uniformBuffers.pleGeluMulParams.push(
         this.makeUniformMixed([{ u: il * C.per_layer_input_dim }, { u: C.per_layer_input_dim }])
       );
+    }
+
+    // MoE uniforms (deepseek-ocr). Shapes are identical for every routed
+    // layer, so one set serves all of them.
+    if (C.moe) {
+      const moe = C.moe;
+      const mI = moe.moe_intermediate_size;
+      this.uniformBuffers.moeRouterMM = this.makeUniformMixed([{ u: moe.num_experts }, { u: H }]);
+      this.uniformBuffers.moeTopkParams = this.makeUniformMixed([
+        { u: moe.num_experts }, { u: moe.experts_per_tok },
+        { u: moe.norm_topk_prob ? 1 : 0 }, { f: moe.routed_scaling_factor },
+      ]);
+      // Gate/up: M = mI rows per expert over N = hidden; shared input (normed).
+      this.uniformBuffers.moeGateUpMM = this.makeUniformMixed([{ u: mI }, { u: H }, { u: mI }, { u: 0 }]);
+      // Down: M = hidden rows per expert over N = mI; per-slot input (ffnMul regions).
+      this.uniformBuffers.moeDownMM = this.makeUniformMixed([{ u: H }, { u: mI }, { u: H }, { u: 1 }]);
+      this.uniformBuffers.sizeMoeAct = this.makeUniformMixed([{ u: moe.experts_per_tok * mI }]);
+      this.uniformBuffers.moeAccumParams = this.makeUniformMixed([{ u: H }, { u: moe.experts_per_tok }]);
     }
   }
 
@@ -727,6 +752,22 @@ export class GemmaEngineImpl implements GemmaEngine {
     });
   }
 
+  /** In-shader-quant matmul bind group for an EXPLICIT pipeline (deepseek-ocr
+   *  mixes q4k and q8 storage within one layer — the mode-derived mmQuant
+   *  can't express that). Same 5-entry layout as mmQuant. */
+  private mmWith(pipe: GPUComputePipeline, input: GPUBuffer, layer: Record<string, GPUBuffer>, key: string, output: GPUBuffer, params: GPUBuffer): GPUBindGroup {
+    return this.device.createBindGroup({
+      layout: pipe.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: input } },
+        { binding: 1, resource: { buffer: layer[key] } },
+        { binding: 2, resource: { buffer: layer[`${key}__s`] } },
+        { binding: 3, resource: { buffer: output } },
+        { binding: 4, resource: { buffer: params } },
+      ],
+    });
+  }
+
   /** Dequantize any GGUF tensor to F16 bit patterns. One-time CPU cost at upload. */
   private tensorToF16(parser: GGUFParser, tensor: GGUFTensor, dataOffset: number): Uint16Array {
     // F16 source can be used directly without the F32 round-trip.
@@ -783,6 +824,9 @@ export class GemmaEngineImpl implements GemmaEngine {
   }
 
   private async uploadWeightsFromBuffer(parser: GGUFParser, gguf: { tensors: GGUFTensor[]; dataOffset: number }): Promise<void> {
+    if (this.config.arch === 'deepseek-ocr') {
+      throw new Error('deepseek-ocr needs the streaming (Range) load path — serve the GGUF from a server that honors Range requests');
+    }
     const tensors = gguf.tensors;
     const dataOffset = gguf.dataOffset;
 
@@ -983,6 +1027,12 @@ export class GemmaEngineImpl implements GemmaEngine {
     dataOffset: number,
     signal?: AbortSignal,
   ): Promise<void> {
+    // deepseek-ocr P0 scope: the MoE expert packs are only wired for the
+    // in-shader-q4k storage mode (gate/up exps q4k; down projections q8 —
+    // their N isn't a multiple of the 256-element q4k super-block).
+    if (this.config.arch === 'deepseek-ocr' && this.weightQuant !== 'q4k') {
+      throw new Error("deepseek-ocr requires weightQuant: 'q4k' (MoE expert packs are q4k/q8 in-shader only)");
+    }
     this.modelBuffers = {
       tokenEmbed: null,
       layers: [],
@@ -1057,21 +1107,25 @@ export class GemmaEngineImpl implements GemmaEngine {
     };
 
     // Q8 path: dequant source → F32 → requantize to in-shader Q8_0. dims[0]=N
-    // (contraction/input), dims[1]=M (output rows) in GGUF's reversed layout.
+    // (contraction/input) in GGUF's reversed layout; M = the remaining dims'
+    // product — dims[1] for 2-D weights, rows x experts for 3-D MoE expert
+    // packs ([N, rows, experts]), which lays every expert's rows out
+    // contiguously exactly as the expert kernels index them.
     const uploadTensorQ8 = (bytes: Uint8Array, localOffset: number, tensor: GGUFTensor): { quants: GPUBuffer; scales: GPUBuffer } => {
       const tp = new GGUFParser(bytes);
       const f32 = tp.getTensorData({ ...tensor, offset: BigInt(localOffset) }, 0);
       const N = Number(tensor.dims[0]);
-      const M = Number(tensor.dims[1]);
+      const M = f32.length / N;
       return this.createQ8Buffers(f32, M, N);
     };
 
     // Q4_K path: dequant source → F32 → requantize to in-shader 4-bit block-affine.
+    // Same M/N convention as the Q8 path (3-D expert packs supported).
     const uploadTensorQ4K = (bytes: Uint8Array, localOffset: number, tensor: GGUFTensor): { quants: GPUBuffer; meta: GPUBuffer } => {
       const tp = new GGUFParser(bytes);
       const f32 = tp.getTensorData({ ...tensor, offset: BigInt(localOffset) }, 0);
       const N = Number(tensor.dims[0]);
-      const M = Number(tensor.dims[1]);
+      const M = f32.length / N;
       return this.createQ4KBuffers(f32, M, N);
     };
 
@@ -1160,6 +1214,22 @@ export class GemmaEngineImpl implements GemmaEngine {
     const perLayerByIdx: Array<NonNullable<LoadTimings['perLayer']>[number] | null> = new Array(numLayers).fill(null);
     let completedLayers = 0;
 
+    const isDsOcr = this.config.arch === 'deepseek-ocr';
+    /**
+     * Find a layer tensor by engine key. deepseek-ocr MoE layers have no
+     * dense `ffn_gate/up/down` — the pre-fused shared-expert FFN
+     * (`ffn_*_shexp`) aliases onto those keys so the standard dense-FFN path
+     * computes shared_experts(x) with zero forward-pass changes.
+     */
+    const findLayerTensor = (layerTensors: GGUFTensor[], prefix: string, key: string): GGUFTensor | undefined => {
+      const t = layerTensors.find(x => x.name === prefix + key + '.weight');
+      if (t || !isDsOcr) return t;
+      if (key === 'ffn_gate' || key === 'ffn_up' || key === 'ffn_down') {
+        return layerTensors.find(x => x.name === prefix + key + '_shexp.weight');
+      }
+      return undefined;
+    };
+
     const uploadOneLayer = async (i: number): Promise<void> => {
       const prefix = `blk.${i}.`;
       const layerTensors = tensors.filter(t => t.name.startsWith(prefix));
@@ -1190,10 +1260,14 @@ export class GemmaEngineImpl implements GemmaEngine {
         }
       }
       for (const key of LAYER_MATMUL_WEIGHT_NAMES) {
-        const tensor = layerTensors.find(t => t.name === prefix + key + '.weight');
+        const tensor = findLayerTensor(layerTensors, prefix, key);
         if (tensor) {
           const localOffset = Number(tensor.offset) - minOffset;
-          if (this.weightQuant === 'q8') {
+          // deepseek-ocr down projections (dense 6848 / shexp 1792) have
+          // N % 256 != 0 → q4k super-blocks can't represent them; q8
+          // (32-block) can. Everything else follows the global mode.
+          const wantQ8 = this.weightQuant === 'q8' || (isDsOcr && key === 'ffn_down');
+          if (wantQ8) {
             const { quants, scales } = uploadTensorQ8(layerBytes, localOffset, tensor);
             layer[key] = quants;
             layer[`${key}__s`] = scales;
@@ -1204,6 +1278,28 @@ export class GemmaEngineImpl implements GemmaEngine {
           } else {
             layer[key] = uploadTensor(layerBytes, localOffset, tensor, true).buf;
           }
+        }
+      }
+      // deepseek-ocr MoE tensors: router (tiny, F16), routed expert packs
+      // (gate/up q4k over N=hidden; down q8 over N=moe_I — see wantQ8 note).
+      if (isDsOcr) {
+        const router = layerTensors.find(x => x.name === prefix + 'ffn_gate_inp.weight');
+        if (router) {
+          layer['ffn_gate_inp'] = uploadTensor(layerBytes, Number(router.offset) - minOffset, router, true).buf;
+        }
+        for (const key of ['ffn_gate_exps', 'ffn_up_exps']) {
+          const t = layerTensors.find(x => x.name === prefix + key + '.weight');
+          if (t) {
+            const { quants, meta } = uploadTensorQ4K(layerBytes, Number(t.offset) - minOffset, t);
+            layer[key] = quants;
+            layer[`${key}__s`] = meta;
+          }
+        }
+        const downExps = layerTensors.find(x => x.name === prefix + 'ffn_down_exps.weight');
+        if (downExps) {
+          const { quants, scales } = uploadTensorQ8(layerBytes, Number(downExps.offset) - minOffset, downExps);
+          layer['ffn_down_exps'] = quants;
+          layer['ffn_down_exps__s'] = scales;
         }
       }
       this.modelBuffers.layers[i] = layer;
@@ -1296,6 +1392,22 @@ export class GemmaEngineImpl implements GemmaEngine {
       plePostNormed: this.device.createBuffer({ size: H * 4, usage: S }),
     };
 
+    // MoE work buffers (deepseek-ocr). The routed experts reuse ffnGate /
+    // ffnUp / ffnMul (sized for I_max = 6848 >= experts_per_tok x moe_I = 5376)
+    // — only the router logits, the top-k selection, and the per-slot
+    // down-proj outputs need dedicated buffers.
+    if (C.moe) {
+      this.workBuffers.moeRouterLogits = this.device.createBuffer({
+        size: Math.max(C.moe.num_experts, 4) * 4, usage: S,
+      });
+      this.workBuffers.moeSel = this.device.createBuffer({
+        size: C.moe.experts_per_tok * 2 * 4, usage: S,
+      });
+      this.workBuffers.moeSlots = this.device.createBuffer({
+        size: C.moe.experts_per_tok * H * 4, usage: S,
+      });
+    }
+
     // Per-layer KV cache sizes. On Gemma 4 LOCAL layers use HD=256, GLOBAL layers use HD=512.
     // Sizing per layer (instead of uniformly at max) saves a few tens of MB at ctx=2048.
     this.kvCaches = [];
@@ -1310,12 +1422,13 @@ export class GemmaEngineImpl implements GemmaEngine {
   }
 
   private createBindGroups(): void {
-    const isQwen3 = this.config.arch === 'qwen3';
+    // PLE machinery exists only on the Gemma 4 path.
+    const hasPle = this.config.arch === undefined || this.config.arch === 'gemma4';
     // Per-layer embedding bind groups — built first so they can land
     // directly in the BindGroupCache object literal below. Qwen3 has no PLE,
     // and the per_layer_model_proj / per_layer_proj_norm / perLayerEmbeddings
     // buffers are never loaded for it — so skip these entirely.
-    const plePmProjMatmul = isQwen3 ? undefined : this.device.createBindGroup({
+    const plePmProjMatmul = !hasPle ? undefined : this.device.createBindGroup({
       layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: { buffer: this.workBuffers.hidden } },
@@ -1325,7 +1438,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       ],
     });
     const pleStage1Fuse: GPUBindGroup[] = [];
-    if (!isQwen3) {
+    if (hasPle) {
       for (let i = 0; i < this.config.num_layers; i++) {
         pleStage1Fuse.push(this.device.createBindGroup({
           layout: this.pipelines.pleStage1Fuse.getBindGroupLayout(0),
@@ -1464,7 +1577,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.perHeadRmsNorm.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.q } },
-            { binding: 1, resource: { buffer: layer.attn_q_norm } },
+            { binding: 1, resource: { buffer: layer.attn_q_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.perHeadRmsNormQ[i] } },
           ],
         }),
@@ -1472,7 +1585,7 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.perHeadRmsNorm.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.k } },
-            { binding: 1, resource: { buffer: layer.attn_k_norm } },
+            { binding: 1, resource: { buffer: layer.attn_k_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.perHeadRmsNormK[i] } },
           ],
         }),
@@ -1490,20 +1603,20 @@ export class GemmaEngineImpl implements GemmaEngine {
           layout: this.pipelines.fusedPerHeadNormRope.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.q } },
-            { binding: 1, resource: { buffer: layer.attn_q_norm } },
+            { binding: 1, resource: { buffer: layer.attn_q_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.fusedNormRopeQ[i] } },
             // Qwen3 has no rope_freqs table (apply_divisor=0 ⇒ never read); bind a
             // present F16 buffer to satisfy the layout.
-            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_q_norm } },
+            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_q_norm ?? layer.attn_norm } },
           ],
         }),
         fusedNormRopeK: this.device.createBindGroup({
           layout: this.pipelines.fusedPerHeadNormRope.getBindGroupLayout(0),
           entries: [
             { binding: 0, resource: { buffer: this.workBuffers.k } },
-            { binding: 1, resource: { buffer: layer.attn_k_norm } },
+            { binding: 1, resource: { buffer: layer.attn_k_norm ?? layer.attn_norm } },
             { binding: 2, resource: { buffer: this.uniformBuffers.fusedNormRopeK[i] } },
-            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_k_norm } },
+            { binding: 3, resource: { buffer: this.modelBuffers.globals.rope_freqs ?? layer.attn_k_norm ?? layer.attn_norm } },
           ],
         }),
         // kvStore writes to this layer's own cache (meaningless for consumer layers; they
@@ -1619,7 +1732,9 @@ export class GemmaEngineImpl implements GemmaEngine {
             { binding: 3, resource: { buffer: this.uniformBuffers.sizeI[i] } },
           ],
         }),
-        ffnDown: this.weightQuant !== 'f16'
+        ffnDown: this.config.arch === 'deepseek-ocr'
+          ? this.mmWith(this.pipelines.matmulQ8Mr, this.workBuffers.ffnMul, layer, 'ffn_down', this.workBuffers.ffnDown, this.uniformBuffers.linearQ8_H_I[i])
+          : this.weightQuant !== 'f16'
           ? this.mmQuant(this.workBuffers.ffnMul, layer, 'ffn_down', this.workBuffers.ffnDown, this.uniformBuffers.linearQ8_H_I[i])
           : this.device.createBindGroup({
           layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
@@ -1741,6 +1856,63 @@ export class GemmaEngineImpl implements GemmaEngine {
           ],
         }),
       };
+      // MoE bind groups (deepseek-ocr routed layers). The shared-expert FFN
+      // rides the standard ffnGate/ffnUp/geluMul/ffnDown groups above via
+      // tensor aliasing; these cover the router + routed-expert pipeline.
+      if (isMoELayer(i, this.config)) {
+        const wb = this.workBuffers;
+        const ub = this.uniformBuffers;
+        lb.moeRouter = this.device.createBindGroup({
+          layout: this.pipelines.matmulQuant.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: wb.normed } },
+            { binding: 1, resource: { buffer: layer.ffn_gate_inp } },
+            { binding: 2, resource: { buffer: wb.moeRouterLogits! } },
+            { binding: 3, resource: { buffer: ub.moeRouterMM! } },
+          ],
+        });
+        lb.moeTopk = this.device.createBindGroup({
+          layout: this.pipelines.moeTopk.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: wb.moeRouterLogits! } },
+            { binding: 1, resource: { buffer: wb.moeSel! } },
+            { binding: 2, resource: { buffer: ub.moeTopkParams! } },
+          ],
+        });
+        const expertBG = (key: string, out: GPUBuffer, params: GPUBuffer, pipe: GPUComputePipeline, input: GPUBuffer) =>
+          this.device.createBindGroup({
+            layout: pipe.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: input } },
+              { binding: 1, resource: { buffer: layer[key] } },
+              { binding: 2, resource: { buffer: layer[`${key}__s`] } },
+              { binding: 3, resource: { buffer: out } },
+              { binding: 4, resource: { buffer: params } },
+              { binding: 5, resource: { buffer: wb.moeSel! } },
+            ],
+          });
+        lb.moeGateExp = expertBG('ffn_gate_exps', wb.ffnGate, ub.moeGateUpMM!, this.pipelines.matmulQ4KExpert, wb.normed);
+        lb.moeUpExp = expertBG('ffn_up_exps', wb.ffnUp, ub.moeGateUpMM!, this.pipelines.matmulQ4KExpert, wb.normed);
+        lb.moeActMul = this.device.createBindGroup({
+          layout: this.pipelines.siluMul.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: wb.ffnGate } },
+            { binding: 1, resource: { buffer: wb.ffnUp } },
+            { binding: 2, resource: { buffer: wb.ffnMul } },
+            { binding: 3, resource: { buffer: ub.sizeMoeAct! } },
+          ],
+        });
+        lb.moeDownExp = expertBG('ffn_down_exps', wb.moeSlots!, ub.moeDownMM!, this.pipelines.matmulQ8Expert, wb.ffnMul);
+        lb.moeAccum = this.device.createBindGroup({
+          layout: this.pipelines.moeAccum.getBindGroupLayout(0),
+          entries: [
+            { binding: 0, resource: { buffer: wb.moeSlots! } },
+            { binding: 1, resource: { buffer: wb.moeSel! } },
+            { binding: 2, resource: { buffer: wb.ffnDown } },
+            { binding: 3, resource: { buffer: ub.moeAccumParams! } },
+          ],
+        });
+      }
       bgc.layers.push(lb);
     }
     this.bindGroupCache = bgc;
@@ -1782,6 +1954,11 @@ export class GemmaEngineImpl implements GemmaEngine {
     const seqU32 = new Uint32Array([seqLen]);
     const tokenU32 = tokenId !== null ? new Uint32Array([tokenId]) : null;
     for (let il = 0; il < C.num_layers; il++) {
+      if (C.qk_norm === false) {
+        // Plain-rope path (deepseek-ocr): rope.wgsl Params.position at offset 8.
+        this.wb(this.uniformBuffers.ropeQ[il], 8, posU32);
+        this.wb(this.uniformBuffers.ropeK[il], 8, posU32);
+      }
       this.wb(this.uniformBuffers.fusedNormRopeQ[il], 12, posU32);
       this.wb(this.uniformBuffers.fusedNormRopeK[il], 12, posU32);
       this.wb(this.uniformBuffers.kvCacheStore[il], 8, posU32);
@@ -1809,7 +1986,7 @@ export class GemmaEngineImpl implements GemmaEngine {
     // Per-layer embedding Stage 1 (runs once, before layer 0). Produces
     // workBuffers.pleInputs [num_layers × per_layer_input_dim]. Gemma 4 only —
     // Qwen3 has no PLE.
-    if (C.arch !== 'qwen3') {
+    if (C.arch === undefined || C.arch === 'gemma4') {
       const pleOut = C.num_layers * C.per_layer_input_dim;
       pass = this.beginPass(encoder, 'ple1.pmProj');
       pass.setPipeline(this.pipelines.matmulQuant);
@@ -1868,6 +2045,17 @@ export class GemmaEngineImpl implements GemmaEngine {
         pass.dispatchWorkgroups(NKH);
         pass.end();
       }
+      if (C.qk_norm === false) {
+        // deepseek-ocr: plain Llama RoPE on raw q/k — no per-head norm.
+        // rope.wgsl covers num_heads*head_dim/2 rotation pairs per dispatch.
+        pass = this.beginPass(encoder, isProducer ? 'attn.ropeQK' : 'attn.ropeQ');
+        pass.setPipeline(this.pipelines.rope);
+        pass.setBindGroup(0, lb.ropeQ); pass.dispatchWorkgroups(Math.ceil((NQH * HD / 2) / 256));
+        if (isProducer) {
+          pass.setBindGroup(0, lb.ropeK); pass.dispatchWorkgroups(Math.ceil((NKH * HD / 2) / 256));
+        }
+        pass.end();
+      } else {
       pass = this.beginPass(encoder, isProducer ? 'attn.fusedNormRopeQK' : 'attn.fusedNormRopeQ');
       pass.setPipeline(this.pipelines.fusedPerHeadNormRope);
       pass.setBindGroup(0, lb.fusedNormRopeQ); pass.dispatchWorkgroups(NQH);
@@ -1875,6 +2063,7 @@ export class GemmaEngineImpl implements GemmaEngine {
         pass.setBindGroup(0, lb.fusedNormRopeK); pass.dispatchWorkgroups(NKH);
       }
       pass.end();
+      }
       if (stopAt && 'layer' in stopAt && stopAt.layer === layerIdx) {
         if (stopAt.kind === 'postRopeQ' || stopAt.kind === 'postRopeK') return;
       }
@@ -1903,7 +2092,30 @@ export class GemmaEngineImpl implements GemmaEngine {
       // FFN activation: Gemma tanh-GELU, Qwen3 SwiGLU/SiLU. Same bind-group layout.
       const actPipeline = C.ffn_activation === 'silu' ? this.pipelines.siluMul : this.pipelines.geluMul;
       pass = this.beginPass(encoder, 'ffn.actMul'); pass.setPipeline(actPipeline); pass.setBindGroup(0, lb.geluMul); pass.dispatchWorkgroups(Math.ceil(I / 256)); pass.end();
-      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(mmPipe); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmulRows(pass, H); pass.end();
+      const mmPipeDown = C.arch === 'deepseek-ocr' ? this.pipelines.matmulQ8Mr : mmPipe;
+      pass = this.beginPass(encoder, 'ffn.linearDown'); pass.setPipeline(mmPipeDown); pass.setBindGroup(0, lb.ffnDown); this.dispatchMatmulRows(pass, H); pass.end();
+      // Routed experts (deepseek-ocr MoE layers). The dense-FFN block above
+      // just computed the SHARED-expert FFN into ffnDown (aliased tensors);
+      // here the router picks top-k experts, the batched expert kernels
+      // (z-dimension = slot) run gate/up/act/down for all k in four
+      // dispatches, and moeAccum lands ffnDown += sum w_k*E_k(normed) — the
+      // full DeepSeek-V2 y = shared(x) + sum w_k E_k(x) before the residual.
+      if (isMoELayer(layerIdx, C)) {
+        const moe = C.moe!;
+        const mI = moe.moe_intermediate_size;
+        const K = moe.experts_per_tok;
+        pass = this.beginPass(encoder, 'moe.router'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.moeRouter!); this.dispatchMatmul(pass, moe.num_experts); pass.end();
+        pass = this.beginPass(encoder, 'moe.topk'); pass.setPipeline(this.pipelines.moeTopk); pass.setBindGroup(0, lb.moeTopk!); pass.dispatchWorkgroups(1); pass.end();
+        // Expert kernels are R=4 multi-row; z = top-k slot.
+        pass = this.beginPass(encoder, 'moe.expGateUp');
+        pass.setPipeline(this.pipelines.matmulQ4KExpert);
+        pass.setBindGroup(0, lb.moeGateExp!); pass.dispatchWorkgroups(Math.ceil(mI / 4), 1, K);
+        pass.setBindGroup(0, lb.moeUpExp!); pass.dispatchWorkgroups(Math.ceil(mI / 4), 1, K);
+        pass.end();
+        pass = this.beginPass(encoder, 'moe.actMul'); pass.setPipeline(this.pipelines.siluMul); pass.setBindGroup(0, lb.moeActMul!); pass.dispatchWorkgroups(Math.ceil((K * mI) / 256)); pass.end();
+        pass = this.beginPass(encoder, 'moe.expDown'); pass.setPipeline(this.pipelines.matmulQ8Expert); pass.setBindGroup(0, lb.moeDownExp!); pass.dispatchWorkgroups(Math.ceil(H / 4), 1, K); pass.end();
+        pass = this.beginPass(encoder, 'moe.accum'); pass.setPipeline(this.pipelines.moeAccum); pass.setBindGroup(0, lb.moeAccum!); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
+      }
       // Post-FFN residual. Gemma: norm(ffnDown)+residual (fused). Qwen3: plain residual+ffnDown.
       if (C.post_ffn_norm === false) {
         pass = this.beginPass(encoder, 'ffn.residualAdd'); pass.setPipeline(this.pipelines.add); pass.setBindGroup(0, lb.qwenFfnAdd); pass.dispatchWorkgroups(Math.ceil(H / 256)); pass.end();
@@ -1912,7 +2124,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       }
 
       // Gemma 4 PLE Stage 2 (per-layer) + layer_output_scale. Qwen3 has no PLE.
-      if (C.arch !== 'qwen3') {
+      if (C.arch === undefined || C.arch === 'gemma4') {
         const P = C.per_layer_input_dim;
         pass = this.beginPass(encoder, 'ple2.linearInpGate'); pass.setPipeline(this.pipelines.matmulQuant); pass.setBindGroup(0, lb.pleInpGateMatmul); this.dispatchMatmul(pass, P); pass.end();
         pass = this.beginPass(encoder, 'ple2.geluMul'); pass.setPipeline(this.pipelines.pleGeluMul); pass.setBindGroup(0, lb.pleGeluMul); pass.dispatchWorkgroups(Math.ceil(P / 256)); pass.end();

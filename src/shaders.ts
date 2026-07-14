@@ -24,6 +24,10 @@ import matmulQ8Src from '../shaders/matmul_q8.wgsl?raw';
 import matmulQ4KSrc from '../shaders/matmul_q4k.wgsl?raw';
 import matmulQ4KMrSrc from '../shaders/matmul_q4k_mr.wgsl?raw';
 import matmulQ8MrSrc from '../shaders/matmul_q8_mr.wgsl?raw';
+import matmulQ4KExpertSrc from '../shaders/matmul_q4k_expert.wgsl?raw';
+import matmulQ8ExpertSrc from '../shaders/matmul_q8_expert.wgsl?raw';
+import moeTopkSrc from '../shaders/moe_topk.wgsl?raw';
+import moeAccumSrc from '../shaders/moe_accum.wgsl?raw';
 import perHeadRmsNormSrc from '../shaders/per_head_rms_norm.wgsl?raw';
 import perHeadRmsNormNoWeightSrc from '../shaders/per_head_rms_norm_no_weight.wgsl?raw';
 import pleGeluMulSrc from '../shaders/ple_gelu_mul.wgsl?raw';
@@ -53,6 +57,10 @@ export const SHADERS: Record<string, string> = {
   matmulQ4K: matmulQ4KSrc,
   matmulQ4KMr: matmulQ4KMrSrc,
   matmulQ8Mr: matmulQ8MrSrc,
+  matmulQ4KExpert: matmulQ4KExpertSrc,
+  matmulQ8Expert: matmulQ8ExpertSrc,
+  moeTopk: moeTopkSrc,
+  moeAccum: moeAccumSrc,
   perHeadRmsNorm: perHeadRmsNormSrc,
   perHeadRmsNormNoWeight: perHeadRmsNormNoWeightSrc,
   pleGeluMul: pleGeluMulSrc,
