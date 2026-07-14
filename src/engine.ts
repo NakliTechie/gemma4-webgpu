@@ -1263,9 +1263,11 @@ export class GemmaEngineImpl implements GemmaEngine {
         const tensor = findLayerTensor(layerTensors, prefix, key);
         if (tensor) {
           const localOffset = Number(tensor.offset) - minOffset;
-          // deepseek-ocr down projections (dense 6848 / shexp 1792) have
-          // N % 256 != 0 → q4k super-blocks can't represent them; q8
-          // (32-block) can. Everything else follows the global mode.
+          // deepseek-ocr down projections go q8: the dense layer-0 down
+          // (N=6848) and the routed-expert down (N=896) aren't multiples of
+          // the 256-elem q4k super-block; shexp down (N=1792) would be, but
+          // shares the q8 path for uniformity — and q8 is the higher-fidelity
+          // round-trip for these Q5_0/Q8_0-source tensors anyway.
           const wantQ8 = this.weightQuant === 'q8' || (isDsOcr && key === 'ffn_down');
           if (wantQ8) {
             const { quants, scales } = uploadTensorQ8(layerBytes, localOffset, tensor);

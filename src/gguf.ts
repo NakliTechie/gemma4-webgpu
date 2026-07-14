@@ -404,7 +404,9 @@ export class GGUFParser {
   getTensorData(tensor: GGUFTensor, dataOffset: number): Float32Array {
     const absOffset = dataOffset + Number(tensor.offset);
     const count = Number(tensor.dims.reduce((a, b) => a * b, 1n));
-    if (tensor.type === 0) return new Float32Array(this.buffer, absOffset, count);
+    // F32: honor the constructor Uint8Array's byteOffset (quantized paths go
+    // through this.view, which carries it; a raw this.buffer view would not).
+    if (tensor.type === 0) return new Float32Array(this.buffer, this.view.byteOffset + absOffset, count);
     if (tensor.type === 1) return this.dequantizeF16(absOffset, count);
     if (tensor.type === 6) return this.dequantizeQ5_0(absOffset, count);
     if (tensor.type === 8) return this.dequantizeQ8_0(absOffset, count);

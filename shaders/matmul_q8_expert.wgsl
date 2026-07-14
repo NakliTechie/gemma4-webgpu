@@ -5,7 +5,8 @@
 // 32-block). Used for `ffn_down_exps`, whose N (= moe_intermediate 896) is not
 // a multiple of 256 — the q4k super-block requirement — but is a multiple of
 // 32, the q8 block. (Bonus: the source tensor is Q5_0, so q8 storage is the
-// higher-fidelity round-trip anyway.)
+// higher-fidelity round-trip anyway. The shexp/dense downs share the q8 path
+// for uniformity even though shexp's N=1792 would satisfy q4k.)
 enable f16;
 struct Params { M: u32, N: u32, rows_per_expert: u32, input_per_slot: u32 }
 @group(0) @binding(0) var<storage, read> input: array<f32>;

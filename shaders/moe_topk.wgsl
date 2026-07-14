@@ -26,8 +26,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   let tid = lid.x;
   let n = params.n;
 
-  // Parallel max.
-  scratch[tid] = select(-3.402823e38, logits[tid], tid < n);
+  // Parallel max. (Index clamped so lanes ≥ n never read OOB; their value
+  // is discarded by the select either way.)
+  scratch[tid] = select(-3.402823e38, logits[min(tid, n - 1u)], tid < n);
   workgroupBarrier();
   var stride: u32 = 128u;
   loop {
@@ -40,7 +41,7 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>) {
   workgroupBarrier();
 
   // Parallel sum of exp(logit - max).
-  scratch[tid] = select(0.0, exp(logits[tid] - wgMax), tid < n);
+  scratch[tid] = select(0.0, exp(logits[min(tid, n - 1u)] - wgMax), tid < n);
   workgroupBarrier();
   stride = 128u;
   loop {
