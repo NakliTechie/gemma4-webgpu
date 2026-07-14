@@ -759,6 +759,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       case 13: elemsPerBlk = 256; bytesPerBlk = 176; break; // Q5_K
       case 14: elemsPerBlk = 256; bytesPerBlk = 210; break; // Q6_K
       case 8:  elemsPerBlk = 32;  bytesPerBlk = 34;  break; // Q8_0
+      case 6:  elemsPerBlk = 32;  bytesPerBlk = 22;  break; // Q5_0
       default: return f32ToF16Array(parser.getTensorData({ ...tensor, offset: BigInt(byteOffset) }, 0));
     }
     const out = new Uint16Array(count);
@@ -771,6 +772,7 @@ export class GemmaEngineImpl implements GemmaEngine {
         case 12: f32 = parser.dequantizeQ4_K(off, n); break;
         case 13: f32 = parser.dequantizeQ5_K(off, n); break;
         case 14: f32 = parser.dequantizeQ6_K(off, n); break;
+        case 6:  f32 = parser.dequantizeQ5_0(off, n); break;
         default: f32 = parser.dequantizeQ8_0(off, n); break;
       }
       for (let i = 0; i < n; i++) out[elem + i] = f32ToF16(f32[i]);
@@ -2767,6 +2769,7 @@ export class GemmaEngineImpl implements GemmaEngine {
     // dequant using a throwaway GGUFParser over the fetched bytes, then slice.
     // blockElems × blockBytes per type (llama.cpp GGML_QUANT_SIZES).
     const BLOCK: Record<number, { elems: number; bytes: number; dequant: (p: GGUFParser, off: number, n: number) => Float32Array }> = {
+      6:  { elems: 32,  bytes: 22,  dequant: (p, o, n) => p.dequantizeQ5_0(o, n) },
       8:  { elems: 32,  bytes: 34,  dequant: (p, o, n) => p.dequantizeQ8_0(o, n) },
       12: { elems: 256, bytes: 144, dequant: (p, o, n) => p.dequantizeQ4_K(o, n) },
       13: { elems: 256, bytes: 176, dequant: (p, o, n) => p.dequantizeQ5_K(o, n) },

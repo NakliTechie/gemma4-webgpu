@@ -2,7 +2,7 @@ import type { GGUFParsed, GGUFTensor, GGUFValue } from './types.js';
 
 /**
  * GGUF v3 parser + dequantization paths for the quant types this engine
- * supports: F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K.
+ * supports: F32, F16, BF16, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K.
  *
  * Every supported source quant is dequantized to F32 once at upload;
  * callers then convert to F16 via `f32ToF16Array` before creating the
@@ -127,6 +127,40 @@ export class GGUFParser {
         result[resultIdx++] = q * scale;
       }
       blockOffset += blockSize;
+    }
+    return result;
+  }
+
+  /**
+   * Dequantize Q5_0 blocks (type 6) to f32. 32 elements in 22 bytes:
+   *   fp16 d (scale)   2 bytes
+   *   qh (5th bits)    4 bytes — one high bit per element, packed LE
+   *   qs (low nibbles) 16 bytes — elements j / j+16 in low / high nibble
+   * x = d * (((qs nibble) | (qh bit << 4)) - 16)   — symmetric, no min.
+   * Per llama.cpp `dequantize_row_q5_0`. Needed for Unlimited-OCR Q4_K_M
+   * (`ffn_down_exps` tensors are Q5_0).
+   */
+  dequantizeQ5_0(offset: number, count: number): Float32Array {
+    const BLOCK_BYTES = 22;
+    const result = new Float32Array(count);
+    let resultIdx = 0;
+    let blockOff = offset;
+    while (resultIdx < count) {
+      const d = this.f16ToF32(this.view.getUint16(blockOff, true));
+      const qh = this.view.getUint32(blockOff + 2, true);
+      const qsOff = blockOff + 6;
+      const take = Math.min(32, count - resultIdx);
+      for (let j = 0; j < 16; j++) {
+        const byte = this.view.getUint8(qsOff + j);
+        const xh0 = ((qh >>> j) << 4) & 0x10;
+        const xh1 = (qh >>> (j + 12)) & 0x10;
+        const x0 = ((byte & 0x0F) | xh0) - 16;
+        const x1 = ((byte >>> 4) | xh1) - 16;
+        if (j < take) result[resultIdx + j] = x0 * d;
+        if (j + 16 < take) result[resultIdx + j + 16] = x1 * d;
+      }
+      resultIdx += take;
+      blockOff += BLOCK_BYTES;
     }
     return result;
   }
@@ -372,6 +406,7 @@ export class GGUFParser {
     const count = Number(tensor.dims.reduce((a, b) => a * b, 1n));
     if (tensor.type === 0) return new Float32Array(this.buffer, absOffset, count);
     if (tensor.type === 1) return this.dequantizeF16(absOffset, count);
+    if (tensor.type === 6) return this.dequantizeQ5_0(absOffset, count);
     if (tensor.type === 8) return this.dequantizeQ8_0(absOffset, count);
     if (tensor.type === 12) return this.dequantizeQ4_K(absOffset, count);
     if (tensor.type === 13) return this.dequantizeQ5_K(absOffset, count);
@@ -386,6 +421,7 @@ export function tensorByteSize(tensor: GGUFTensor): number {
   const numElements = Number(tensor.dims.reduce((a, b) => a * b, 1n));
   if (tensor.type === 0) return numElements * 4;            // F32
   if (tensor.type === 1) return numElements * 2;            // F16
+  if (tensor.type === 6) return (numElements / 32) * 22;    // Q5_0: 22 bytes per 32-block
   if (tensor.type === 8) return (numElements / 32) * 34;    // Q8_0: 34 bytes per 32-block
   if (tensor.type === 12) return (numElements / 256) * 144; // Q4_K: 144 bytes per 256-super-block
   if (tensor.type === 13) return (numElements / 256) * 176; // Q5_K: 176 bytes
