@@ -88,7 +88,10 @@ print(f"[{time.time()-t0:.1f}s] decoder loaded")
 
 tok = AutoTokenizer.from_pretrained(str(MODEL_DIR))
 BOS, EOS = 0, 1
-prompt_ids = tok("\nFree OCR.", add_special_tokens=False)["input_ids"]
+import sys
+PROMPT = sys.argv[1] if len(sys.argv) > 1 else "\nFree OCR."
+prompt_ids = tok(PROMPT, add_special_tokens=False)["input_ids"]
+print(f"prompt: {PROMPT!r} → {prompt_ids}")
 ids = [BOS] + [128815] * 273 + prompt_ids
 embeds = model.model.embed_tokens(torch.tensor([ids]))            # [1,T,1280] bf16
 embeds[0, 1:274] = vision_seq.to(torch.bfloat16)

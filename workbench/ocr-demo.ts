@@ -22,7 +22,10 @@ const ORT_URL = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.26.0/dist/ort.we
 
 const BOS = 0;
 const EOS = 1;
-const PROMPT_IDS = [201, 21431, 126041, 16]; // "\nFree OCR."
+// Canonical Unlimited-OCR prompt (model README: `<image>document parsing.`).
+// Empirically decisive: with this prompt the bf16 control transcribes with
+// det boxes; "\nFree OCR." (the DeepSeek-OCR-v1 phrasing) → instant EOS.
+const PROMPT_IDS = [34030, 76466, 16]; // "document parsing."
 const H = 1280;
 const GRID = 16; // 16×16 vision tokens per 1024² view
 
