@@ -22,7 +22,9 @@ const CTX = 1024; // deliberately smaller than prefix+output — the ring makes 
 const say = (s: string) => {
   document.getElementById('status')!.textContent = s;
   console.log('[longdoc]', s);
-  try { localStorage.setItem('longdoc_stage', s); } catch { /* quota */ }
+  // Never record the idle banner — the post-crash reload would stamp it over
+  // the crash-time stage and destroy the evidence.
+  if (!s.startsWith('idle')) { try { localStorage.setItem('longdoc_stage', s); } catch { /* quota */ } }
 };
 // Surface where a crashed previous run died (localStorage survives reloads).
 const prev = localStorage.getItem('longdoc_stage');
@@ -30,11 +32,19 @@ if (prev) console.warn('[longdoc] previous run last stage:', prev);
 const metrics = (s: string) => { document.getElementById('metrics')!.textContent = s; };
 
 async function drawPage(idx: number, url: string): Promise<void> {
-  const img = new Image();
-  img.src = url;
-  await img.decode();
-  const cv = document.getElementById('p' + idx) as HTMLCanvasElement;
-  cv.getContext('2d')!.drawImage(img, 0, 0, 1024, 1024);
+  // fetch + createImageBitmap, NOT new Image().decode(): detached-image
+  // decode is throttled indefinitely in a backgrounded tab — the whole run
+  // hung here (before the first stage marker) on every backgrounded attempt.
+  // Cosmetic only (verification uses precomputed embeds) → non-fatal.
+  try {
+    const blob = await (await fetch(url)).blob();
+    const bmp = await createImageBitmap(blob);
+    const cv = document.getElementById('p' + idx) as HTMLCanvasElement;
+    cv.getContext('2d')!.drawImage(bmp, 0, 0, 1024, 1024);
+    bmp.close();
+  } catch (e) {
+    console.warn('[longdoc] page draw skipped:', e);
+  }
 }
 
 function preprocess(idx: number): Float32Array {
