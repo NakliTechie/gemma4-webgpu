@@ -2835,9 +2835,11 @@ export class GemmaEngineImpl implements GemmaEngine {
     this.ringPrefixLen = null;
   }
 
-  beginRingDecode(): number {
+  beginRingDecode(prefixLen?: number): number {
     if (!this.config.ring_window) return -1;
-    this.ringPrefixLen = this.kvPosition;
+    // Explicit prefixLen for capture-driven decode loops, where the last
+    // prompt token's forward runs inside the loop (kvPosition lags by one).
+    this.ringPrefixLen = prefixLen ?? this.kvPosition;
     return this.ringPrefixLen;
   }
 

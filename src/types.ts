@@ -430,7 +430,7 @@ export interface GemmaEngine {
    * output length. No-op unless the config defines `ring_window`. Cleared by
    * resetKVForCapture()/resetConversation(). Returns the boundary P.
    */
-  beginRingDecode(): number;
+  beginRingDecode(prefixLen?: number): number;
   /** Reset KV caches without clearing conversation history. */
   resetKVForCapture(): void;
   /**
