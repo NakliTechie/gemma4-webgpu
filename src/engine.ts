@@ -114,6 +114,8 @@ export class GemmaEngineImpl implements GemmaEngine {
 
   private conversationHistory: ConversationTurn[] = [];
   private kvPosition: number = 0;
+  /** R-SWA reference boundary (P). null = ring inactive → plain positional KV. */
+  private ringPrefixLen: number | null = null;
   /** Optional system instruction, emitted as a `developer` turn preamble. */
   private _systemPrompt: string | null = null;
   /** Timing stats from the most recent `generate()` call. See the
@@ -1953,8 +1955,18 @@ export class GemmaEngineImpl implements GemmaEngine {
     if (tokenId !== null) {
       this.wb(this.uniformBuffers.embeddingLookup, 4, new Uint32Array([tokenId]));
     }
-    const posU32 = new Uint32Array([position]);
-    const seqU32 = new Uint32Array([seqLen]);
+    // R-SWA ring mapping (deepseek-ocr long-doc mode). Active only past the
+    // reference boundary P set by beginRingDecode(). Until the ring wraps
+    // (position < P + W) slot === position and kvLen === position + 1, so the
+    // encoded work is bit-identical to the non-ring path by construction.
+    const W = C.ring_window ?? 0;
+    const P = this.ringPrefixLen;
+    const ringActive = W > 0 && P !== null && position >= P;
+    const writeSlot = ringActive ? P + ((position - P) % W) : position;
+    const kvLen = ringActive ? Math.min(seqLen, P + W) : seqLen;
+    const posU32 = new Uint32Array([position]);      // true position — RoPE only
+    const slotU32 = new Uint32Array([writeSlot]);    // cache slot — KV store
+    const seqU32 = new Uint32Array([kvLen]);         // valid cache entries — attn/softmax
     const tokenU32 = tokenId !== null ? new Uint32Array([tokenId]) : null;
     for (let il = 0; il < C.num_layers; il++) {
       if (C.qk_norm === false) {
@@ -1964,7 +1976,7 @@ export class GemmaEngineImpl implements GemmaEngine {
       }
       this.wb(this.uniformBuffers.fusedNormRopeQ[il], 12, posU32);
       this.wb(this.uniformBuffers.fusedNormRopeK[il], 12, posU32);
-      this.wb(this.uniformBuffers.kvCacheStore[il], 8, posU32);
+      this.wb(this.uniformBuffers.kvCacheStore[il], 8, slotU32);
       this.wb(this.uniformBuffers.attnScore[il], 12, seqU32);
       this.wb(this.uniformBuffers.attnOutput[il], 12, seqU32);
       if (tokenU32 !== null) {
@@ -2701,6 +2713,7 @@ export class GemmaEngineImpl implements GemmaEngine {
   resetConversation(): void {
     this.conversationHistory = [];
     this.kvPosition = 0;
+    this.ringPrefixLen = null;
     this.resetKVCaches();
   }
 
@@ -2819,6 +2832,13 @@ export class GemmaEngineImpl implements GemmaEngine {
   resetKVForCapture(): void {
     this.resetKVCaches();
     this.kvPosition = 0;
+    this.ringPrefixLen = null;
+  }
+
+  beginRingDecode(): number {
+    if (!this.config.ring_window) return -1;
+    this.ringPrefixLen = this.kvPosition;
+    return this.ringPrefixLen;
   }
 
   decodeTokens(tokenIds: number[]): string {

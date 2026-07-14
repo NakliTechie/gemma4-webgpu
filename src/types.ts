@@ -118,6 +118,17 @@ export interface GemmaConfig {
     norm_topk_prob: boolean;          // false
     routed_scaling_factor: number;    // 1.0
   };
+  /**
+   * R-SWA ring-buffer KV window (Unlimited-OCR: 128, HF `sliding_window_size`).
+   * Semantics differ from Gemma's mask-based `sliding_window`: reference/prefill
+   * tokens are kept in-cache FOREVER; only GENERATED tokens recycle a
+   * `ring_window`-slot ring appended after the prefix. Decode attends the whole
+   * valid cache unmasked (keys keep their true RoPE rotations, so position gaps
+   * are benign — softmax is permutation-invariant). Engaged per-decode via
+   * `engine.beginRingDecode()`; until the ring wraps, computation is
+   * BIT-IDENTICAL to full-causal (slots and lengths coincide).
+   */
+  ring_window?: number;
 }
 
 /** True if layer `il` runs the MoE FFN (routed + shared experts). */
@@ -412,6 +423,14 @@ export interface GemmaEngine {
    * vision tokens. Composes with prefillForCapture for interleaved sequences.
    */
   prefillEmbedsForCapture(embeds: Float32Array, startPos: number): Promise<void>;
+  /**
+   * Mark the current KV position as the R-SWA reference boundary: everything
+   * prefilled so far stays cached forever; tokens fed at later positions
+   * recycle a `config.ring_window`-slot ring. KV memory becomes constant in
+   * output length. No-op unless the config defines `ring_window`. Cleared by
+   * resetKVForCapture()/resetConversation(). Returns the boundary P.
+   */
+  beginRingDecode(): number;
   /** Reset KV caches without clearing conversation history. */
   resetKVForCapture(): void;
   /**
